@@ -267,9 +267,11 @@ impl TypeConverter {
             Mutability::Mutable
         };
 
-        match ctxt.resolve_type(qtype.ctype).kind {
+        let res = match ctxt.resolve_type(qtype.ctype).kind {
             // While void converts to () in function returns, it converts to c_void
             // in the case of pointers.
+
+            // Is this commonly used for structure polymorphysm ? like the Any type ?
             CTypeKind::Void => Ok(mk()
                 .set_mutbl(mutbl)
                 .ptr_ty(mk().path_ty(vec!["std", "ffi", "c_void"]))),
@@ -285,20 +287,24 @@ impl TypeConverter {
             // Function pointers are translated to Option applied to the function type
             // in order to support NULL function pointers natively
             CTypeKind::Function(..) => {
+                println!("WHAT IS THIS");
                 let fn_ty = self.convert(ctxt, qtype.ctype)?;
                 let param = mk().angle_bracketed_args(vec![fn_ty]);
                 Ok(mk().path_ty(vec![mk().path_segment_with_args("Option", param)]))
             }
 
             _ => {
+                // This Should be an &[T] according to IRIA people
                 let child_ty = self.convert(ctxt, qtype.ctype)?;
+                println!("{child_ty:?}");
                 Ok(mk().set_mutbl(mutbl).ptr_ty(child_ty))
             }
-        }
+        };
+        todo!();
+        res
     }
 
-    /// Convert a `C` type to a `Rust` one. For the moment, these are expected to have compatible
-    /// memory layouts.
+    /// Convert a `C` type to a `Rust` one.
     pub fn convert(
         &mut self,
         ctxt: &TypedAstContext,
@@ -311,24 +317,25 @@ impl TypeConverter {
         }
 
         match ctxt.index(ctype).kind {
+            // Not sure about some of these translations, but ffi seems ugly.
             CTypeKind::Void => Ok(mk().tuple_ty(vec![])),
             CTypeKind::Bool => Ok(mk().path_ty(mk().path(vec!["bool"]))),
-            CTypeKind::Short => Ok(mk().path_ty(mk().path(vec!["std", "ffi", "c_short"]))),
-            CTypeKind::Int => Ok(mk().path_ty(mk().path(vec!["std", "ffi", "c_int"]))),
-            CTypeKind::Long => Ok(mk().path_ty(mk().path(vec!["std", "ffi", "c_long"]))),
-            CTypeKind::LongLong => Ok(mk().path_ty(mk().path(vec!["std", "ffi", "c_longlong"]))),
-            CTypeKind::UShort => Ok(mk().path_ty(mk().path(vec!["std", "ffi", "c_ushort"]))),
-            CTypeKind::UInt => Ok(mk().path_ty(mk().path(vec!["std", "ffi", "c_uint"]))),
-            CTypeKind::ULong => Ok(mk().path_ty(mk().path(vec!["std", "ffi", "c_ulong"]))),
-            CTypeKind::ULongLong => Ok(mk().path_ty(mk().path(vec!["std", "ffi", "c_ulonglong"]))),
-            CTypeKind::SChar => Ok(mk().path_ty(mk().path(vec!["std", "ffi", "c_schar"]))),
-            CTypeKind::UChar => Ok(mk().path_ty(mk().path(vec!["std", "ffi", "c_uchar"]))),
-            CTypeKind::Char => Ok(mk().path_ty(mk().path(vec!["std", "ffi", "c_char"]))),
-            CTypeKind::Double => Ok(mk().path_ty(mk().path(vec!["std", "ffi", "c_double"]))),
+            CTypeKind::Short => Ok(mk().path_ty(mk().path(vec!["i16"]))),
+            CTypeKind::Int => Ok(mk().path_ty(mk().path(vec!["i32"]))),
+            CTypeKind::Long => Ok(mk().path_ty(mk().path(vec!["i64"]))),
+            CTypeKind::LongLong => Ok(mk().path_ty(mk().path(vec!["i64"]))),
+            CTypeKind::UShort => Ok(mk().path_ty(mk().path(vec!["u16"]))),
+            CTypeKind::UInt => Ok(mk().path_ty(mk().path(vec!["u32"]))),
+            CTypeKind::ULong => Ok(mk().path_ty(mk().path(vec!["u64"]))),
+            CTypeKind::ULongLong => Ok(mk().path_ty(mk().path(vec!["u64"]))),
+            CTypeKind::SChar => Ok(mk().path_ty(mk().path(vec!["i8"]))),
+            CTypeKind::UChar => Ok(mk().path_ty(mk().path(vec!["u8"]))),
+            CTypeKind::Char => Ok(mk().path_ty(mk().path(vec!["i8"]))),
+            CTypeKind::Double => Ok(mk().path_ty(mk().path(vec!["f64"]))),
             CTypeKind::LongDouble | CTypeKind::Float128 => {
-                Ok(mk().path_ty(mk().path(vec!["f128", "f128"])))
+                Ok(mk().path_ty(mk().path(vec!["f128", "f128"]))) // Why this ?
             }
-            CTypeKind::Float => Ok(mk().path_ty(mk().path(vec!["std", "ffi", "c_float"]))),
+            CTypeKind::Float => Ok(mk().path_ty(mk().path(vec!["f32"]))),
             CTypeKind::Int128 => Ok(mk().path_ty(mk().path(vec!["i128"]))),
             CTypeKind::UInt128 => Ok(mk().path_ty(mk().path(vec!["u128"]))),
             CTypeKind::BFloat16 => Ok(mk().path_ty(mk().path(vec!["bf16"]))),

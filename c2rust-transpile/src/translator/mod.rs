@@ -505,388 +505,379 @@ pub fn translate(
         expanding_macro: None,
     };
 
-    {
-        t.use_crate(ExternCrate::Libc);
+    t.use_crate(ExternCrate::Libc);
 
-        // Sort the top-level declarations by file and source location so that we
-        // preserve the ordering of all declarations in each file.
-        t.ast_context.sort_top_decls();
+    // Sort the top-level declarations by file and source location so that we
+    // preserve the ordering of all declarations in each file.
+    t.ast_context.sort_top_decls();
 
-        t.locate_comments();
+    t.locate_comments();
 
-        // Headers often pull in declarations that are unused;
-        // we simplify the translator output by omitting those.
-        t.ast_context
-            .prune_unwanted_decls(tcfg.preserve_unused_functions);
+    // Headers often pull in declarations that are unused;
+    // we simplify the translator output by omitting those.
+    t.ast_context
+        .prune_unwanted_decls(tcfg.preserve_unused_functions);
 
-        enum Name<'a> {
-            Var(&'a str),
-            Type(&'a str),
-            Anonymous,
-            None,
+    enum Name<'a> {
+        Var(&'a str),
+        Type(&'a str),
+        Anonymous,
+        None,
+    }
+
+    fn some_type_name(s: Option<&str>) -> Name {
+        match s {
+            None => Name::Anonymous,
+            Some(r) => Name::Type(r),
         }
+    }
 
-        fn some_type_name(s: Option<&str>) -> Name {
-            match s {
-                None => Name::Anonymous,
-                Some(r) => Name::Type(r),
-            }
-        }
+    // Used for testing; so that we don't overlap with C function names
+    if let Some(ref prefix) = t.tcfg.prefix_function_names {
+        prefix_names(&mut t, prefix);
+    }
 
-        // Used for testing; so that we don't overlap with C function names
-        if let Some(ref prefix) = t.tcfg.prefix_function_names {
-            prefix_names(&mut t, prefix);
-        }
+    // Identify typedefs that name unnamed types and collapse the two declarations
+    // into a single name and declaration, eliminating the typedef altogether.
+    let mut prenamed_decls: IndexMap<CDeclId, CDeclId> = IndexMap::new();
+    for (&decl_id, decl) in t.ast_context.iter_decls() {
+        if let CDeclKind::Typedef { ref name, typ, .. } = decl.kind {
+            if let Some(subdecl_id) = t
+                .ast_context
+                .resolve_type(typ.ctype)
+                .kind
+                .as_underlying_decl()
+            {
+                use CDeclKind::*;
+                let is_unnamed = match t.ast_context[subdecl_id].kind {
+                    Struct { name: None, .. }
+                    | Union { name: None, .. }
+                    | Enum { name: None, .. } => true,
 
-        // Identify typedefs that name unnamed types and collapse the two declarations
-        // into a single name and declaration, eliminating the typedef altogether.
-        let mut prenamed_decls: IndexMap<CDeclId, CDeclId> = IndexMap::new();
-        for (&decl_id, decl) in t.ast_context.iter_decls() {
-            if let CDeclKind::Typedef { ref name, typ, .. } = decl.kind {
-                if let Some(subdecl_id) = t
-                    .ast_context
-                    .resolve_type(typ.ctype)
-                    .kind
-                    .as_underlying_decl()
-                {
-                    use CDeclKind::*;
-                    let is_unnamed = match t.ast_context[subdecl_id].kind {
-                        Struct { name: None, .. }
-                        | Union { name: None, .. }
-                        | Enum { name: None, .. } => true,
-
-                        // Detect case where typedef and struct share the same name.
-                        // In this case the purpose of the typedef was simply to eliminate
-                        // the need for the 'struct' tag when referring to the type name.
-                        Struct {
-                            name: Some(ref target_name),
-                            ..
-                        }
-                        | Union {
-                            name: Some(ref target_name),
-                            ..
-                        }
-                        | Enum {
-                            name: Some(ref target_name),
-                            ..
-                        } => name == target_name,
-
-                        _ => false,
-                    };
-
-                    if is_unnamed
-                        && !prenamed_decls
-                            .values()
-                            .any(|decl_id| *decl_id == subdecl_id)
-                    {
-                        prenamed_decls.insert(decl_id, subdecl_id);
-
-                        t.type_converter
-                            .borrow_mut()
-                            .declare_decl_name(decl_id, name);
-                        t.type_converter
-                            .borrow_mut()
-                            .alias_decl_name(subdecl_id, decl_id);
+                    // Detect case where typedef and struct share the same name.
+                    // In this case the purpose of the typedef was simply to eliminate
+                    // the need for the 'struct' tag when referring to the type name.
+                    Struct {
+                        name: Some(ref target_name),
+                        ..
                     }
-                }
-            }
-        }
+                    | Union {
+                        name: Some(ref target_name),
+                        ..
+                    }
+                    | Enum {
+                        name: Some(ref target_name),
+                        ..
+                    } => name == target_name,
 
-        t.ast_context.prenamed_decls = prenamed_decls;
+                    _ => false,
+                };
 
-        // Helper function that returns true if there is either a matching typedef or its
-        // corresponding struct/union/enum
-        fn contains(prenamed_decls: &IndexMap<CDeclId, CDeclId>, decl_id: &CDeclId) -> bool {
-            prenamed_decls.contains_key(decl_id)
-                || prenamed_decls.values().any(|id| *id == *decl_id)
-        }
+                if is_unnamed
+                    && !prenamed_decls
+                        .values()
+                        .any(|decl_id| *decl_id == subdecl_id)
+                {
+                    prenamed_decls.insert(decl_id, subdecl_id);
 
-        // Populate renamer with top-level names
-        for (&decl_id, decl) in t.ast_context.iter_decls() {
-            use CDeclKind::*;
-            let decl_name = match decl.kind {
-                _ if contains(&t.ast_context.prenamed_decls, &decl_id) => Name::None,
-                Struct { ref name, .. } => some_type_name(name.as_ref().map(String::as_str)),
-                Enum { ref name, .. } => some_type_name(name.as_ref().map(String::as_str)),
-                Union { ref name, .. } => some_type_name(name.as_ref().map(String::as_str)),
-                Typedef { ref name, .. } => Name::Type(name),
-                Function { ref name, .. } => Name::Var(name),
-                EnumConstant { ref name, .. } => Name::Var(name),
-                Variable { ref ident, .. } if t.ast_context.c_decls_top.contains(&decl_id) => {
-                    Name::Var(ident)
-                }
-                MacroObject { ref name, .. } => Name::Var(name),
-                _ => Name::None,
-            };
-            match decl_name {
-                Name::None => (),
-                Name::Anonymous => {
-                    t.type_converter
-                        .borrow_mut()
-                        .declare_decl_name(decl_id, "C2RustUnnamed");
-                }
-                Name::Type(name) => {
                     t.type_converter
                         .borrow_mut()
                         .declare_decl_name(decl_id, name);
-                }
-                Name::Var(name) => {
-                    t.renamer.borrow_mut().insert(decl_id, name);
+                    t.type_converter
+                        .borrow_mut()
+                        .alias_decl_name(subdecl_id, decl_id);
                 }
             }
         }
+    }
 
-        {
-            let convert_type = |decl_id: CDeclId, decl: &CDecl| {
-                let decl_file_id = t.ast_context.file_id(decl);
-                if t.tcfg.reorganize_definitions {
-                    *t.cur_file.borrow_mut() = decl_file_id;
+    t.ast_context.prenamed_decls = prenamed_decls;
+
+    // Helper function that returns true if there is either a matching typedef or its
+    // corresponding struct/union/enum
+    fn contains(prenamed_decls: &IndexMap<CDeclId, CDeclId>, decl_id: &CDeclId) -> bool {
+        prenamed_decls.contains_key(decl_id) || prenamed_decls.values().any(|id| *id == *decl_id)
+    }
+
+    // Populate renamer with top-level names
+    for (&decl_id, decl) in t.ast_context.iter_decls() {
+        use CDeclKind::*;
+        let decl_name = match decl.kind {
+            _ if contains(&t.ast_context.prenamed_decls, &decl_id) => Name::None,
+            Struct { ref name, .. } => some_type_name(name.as_ref().map(String::as_str)),
+            Enum { ref name, .. } => some_type_name(name.as_ref().map(String::as_str)),
+            Union { ref name, .. } => some_type_name(name.as_ref().map(String::as_str)),
+            Typedef { ref name, .. } => Name::Type(name),
+            Function { ref name, .. } => Name::Var(name),
+            EnumConstant { ref name, .. } => Name::Var(name),
+            Variable { ref ident, .. } if t.ast_context.c_decls_top.contains(&decl_id) => {
+                Name::Var(ident)
+            }
+            MacroObject { ref name, .. } => Name::Var(name),
+            _ => Name::None,
+        };
+        match decl_name {
+            Name::None => (),
+            Name::Anonymous => {
+                t.type_converter
+                    .borrow_mut()
+                    .declare_decl_name(decl_id, "C2RustUnnamed");
+            }
+            Name::Type(name) => {
+                t.type_converter
+                    .borrow_mut()
+                    .declare_decl_name(decl_id, name);
+            }
+            Name::Var(name) => {
+                t.renamer.borrow_mut().insert(decl_id, name);
+            }
+        }
+    }
+
+    {
+        let convert_type = |decl_id: CDeclId, decl: &CDecl| {
+            let decl_file_id = t.ast_context.file_id(decl);
+            if t.tcfg.reorganize_definitions {
+                *t.cur_file.borrow_mut() = decl_file_id;
+            }
+            match t.convert_decl(ctx, decl_id) {
+                Err(e) => {
+                    let k = &t.ast_context.get_decl(&decl_id).map(|x| &x.kind);
+                    let msg = format!("Skipping declaration {:?} due to error: {}", k, e);
+                    translate_failure(t.tcfg, &msg);
                 }
-                match t.convert_decl(ctx, decl_id) {
-                    Err(e) => {
-                        let k = &t.ast_context.get_decl(&decl_id).map(|x| &x.kind);
-                        let msg = format!("Skipping declaration {:?} due to error: {}", k, e);
-                        translate_failure(t.tcfg, &msg);
-                    }
-                    Ok(converted_decl) => {
-                        use ConvertedDecl::*;
-                        match converted_decl {
-                            Item(item) => {
+                Ok(converted_decl) => {
+                    use ConvertedDecl::*;
+                    match converted_decl {
+                        Item(item) => {
+                            t.insert_item(item, decl);
+                        }
+                        ForeignItem(item) => {
+                            t.insert_foreign_item(*item, decl);
+                        }
+                        Items(items) => {
+                            for item in items {
                                 t.insert_item(item, decl);
                             }
-                            ForeignItem(item) => {
-                                t.insert_foreign_item(*item, decl);
-                            }
-                            Items(items) => {
-                                for item in items {
-                                    t.insert_item(item, decl);
-                                }
-                            }
-                            NoItem => {}
                         }
+                        NoItem => {}
                     }
-                }
-                t.cur_file.borrow_mut().take();
-
-                if t.tcfg.reorganize_definitions
-                    && decl_file_id.map_or(false, |id| id != t.main_file)
-                {
-                    t.generate_submodule_imports(decl_id, decl_file_id);
-                }
-            };
-
-            // Export all types
-            for (&decl_id, decl) in t.ast_context.iter_decls() {
-                use CDeclKind::*;
-                let needs_export = match decl.kind {
-                    Struct { .. } => true,
-                    Enum { .. } => true,
-                    EnumConstant { .. } => true,
-                    Union { .. } => true,
-                    Typedef { .. } => {
-                        // Only check the key as opposed to `contains`
-                        // because the key should be the typedef id
-                        !t.ast_context.prenamed_decls.contains_key(&decl_id)
-                    }
-                    _ => false,
-                };
-                if needs_export {
-                    convert_type(decl_id, decl);
                 }
             }
-        }
+            t.cur_file.borrow_mut().take();
 
-        // Export top-level value declarations
-        for top_id in &t.ast_context.c_decls_top {
+            if t.tcfg.reorganize_definitions && decl_file_id.map_or(false, |id| id != t.main_file) {
+                t.generate_submodule_imports(decl_id, decl_file_id);
+            }
+        };
+
+        // Export all types
+        for (&decl_id, decl) in t.ast_context.iter_decls() {
             use CDeclKind::*;
-            let needs_export = match t.ast_context[*top_id].kind {
-                Function { is_implicit, .. } => !is_implicit,
-                Variable { .. } => true,
-                MacroObject { .. } => tcfg.translate_const_macros,
-                MacroFunction { .. } => tcfg.translate_fn_macros,
+            let needs_export = match decl.kind {
+                Struct { .. } => true,
+                Enum { .. } => true,
+                EnumConstant { .. } => true,
+                Union { .. } => true,
+                Typedef { .. } => {
+                    // Only check the key as opposed to `contains`
+                    // because the key should be the typedef id
+                    !t.ast_context.prenamed_decls.contains_key(&decl_id)
+                }
                 _ => false,
             };
             if needs_export {
-                let decl_opt = t.ast_context.get_decl(top_id);
-                let decl = decl_opt.as_ref().unwrap();
-                let decl_file_id = t.ast_context.file_id(decl);
+                convert_type(decl_id, decl);
+            }
+        }
+    }
 
-                if t.tcfg.reorganize_definitions
-                    && decl_file_id.map_or(false, |id| id != t.main_file)
-                {
-                    *t.cur_file.borrow_mut() = decl_file_id;
+    // Export top-level value declarations
+    for top_id in &t.ast_context.c_decls_top {
+        use CDeclKind::*;
+        let needs_export = match t.ast_context[*top_id].kind {
+            Function { is_implicit, .. } => !is_implicit,
+            Variable { .. } => true,
+            MacroObject { .. } => tcfg.translate_const_macros,
+            MacroFunction { .. } => tcfg.translate_fn_macros,
+            _ => false,
+        };
+        if needs_export {
+            let decl_opt = t.ast_context.get_decl(top_id);
+            let decl = decl_opt.as_ref().unwrap();
+            let decl_file_id = t.ast_context.file_id(decl);
+
+            if t.tcfg.reorganize_definitions && decl_file_id.map_or(false, |id| id != t.main_file) {
+                *t.cur_file.borrow_mut() = decl_file_id;
+            }
+            match t.convert_decl(ctx, *top_id) {
+                Err(e) => {
+                    let decl = &t.ast_context.get_decl(top_id);
+                    let msg = match decl {
+                        Some(decl) => {
+                            let decl_identifier = decl.kind.get_name().map_or_else(
+                                || {
+                                    t.ast_context
+                                        .display_loc(&decl.loc)
+                                        .map_or("Unknown".to_string(), |l| format!("at {}", l))
+                                },
+                                |name| name.clone(),
+                            );
+                            format!("Failed to translate {}: {}", decl_identifier, e)
+                        }
+                        _ => format!("Failed to translate declaration: {}", e,),
+                    };
+                    translate_failure(t.tcfg, &msg);
                 }
-                match t.convert_decl(ctx, *top_id) {
-                    Err(e) => {
-                        let decl = &t.ast_context.get_decl(top_id);
-                        let msg = match decl {
-                            Some(decl) => {
-                                let decl_identifier = decl.kind.get_name().map_or_else(
-                                    || {
-                                        t.ast_context
-                                            .display_loc(&decl.loc)
-                                            .map_or("Unknown".to_string(), |l| format!("at {}", l))
-                                    },
-                                    |name| name.clone(),
-                                );
-                                format!("Failed to translate {}: {}", decl_identifier, e)
-                            }
-                            _ => format!("Failed to translate declaration: {}", e,),
-                        };
-                        translate_failure(t.tcfg, &msg);
-                    }
-                    Ok(converted_decl) => {
-                        use ConvertedDecl::*;
-                        match converted_decl {
-                            Item(item) => {
+                Ok(converted_decl) => {
+                    use ConvertedDecl::*;
+                    match converted_decl {
+                        Item(item) => {
+                            t.insert_item(item, decl);
+                        }
+                        ForeignItem(item) => {
+                            t.insert_foreign_item(*item, decl);
+                        }
+                        Items(items) => {
+                            for item in items {
                                 t.insert_item(item, decl);
                             }
-                            ForeignItem(item) => {
-                                t.insert_foreign_item(*item, decl);
-                            }
-                            Items(items) => {
-                                for item in items {
-                                    t.insert_item(item, decl);
-                                }
-                            }
-                            NoItem => {}
                         }
+                        NoItem => {}
                     }
                 }
-                t.cur_file.borrow_mut().take();
+            }
+            t.cur_file.borrow_mut().take();
 
-                if t.tcfg.reorganize_definitions
-                    && decl_file_id.map_or(false, |id| id != t.main_file)
-                {
-                    t.generate_submodule_imports(*top_id, decl_file_id);
-                }
+            if t.tcfg.reorganize_definitions && decl_file_id.map_or(false, |id| id != t.main_file) {
+                t.generate_submodule_imports(*top_id, decl_file_id);
             }
         }
-
-        // Add the main entry point
-        if let Some(main_id) = t.ast_context.c_main {
-            match t.convert_main(main_id) {
-                Ok(item) => t.items.borrow_mut()[&t.main_file].add_item(item),
-                Err(e) => {
-                    let msg = format!("Failed to translate main: {}", e);
-                    translate_failure(t.tcfg, &msg)
-                }
-            }
-        }
-
-        // Initialize global statics when necessary
-        if !t.sectioned_static_initializers.borrow().is_empty() {
-            let (initializer_fn, initializer_static) = t.generate_global_static_init();
-            let store = &mut t.items.borrow_mut()[&t.main_file];
-
-            store.add_item(initializer_fn);
-            store.add_item(initializer_static);
-        }
-
-        let pragmas = t.get_pragmas();
-        let crates = t.extern_crates.borrow().clone();
-
-        let mut mod_items: Vec<Box<Item>> = Vec::new();
-
-        // Keep track of new uses we need while building header submodules
-        let mut new_uses = ItemStore::new();
-
-        // Header Reorganization: Submodule Item Stores
-        for (file_id, ref mut mod_item_store) in t.items.borrow_mut().iter_mut() {
-            if *file_id != t.main_file {
-                if tcfg.reorganize_definitions {
-                    t.use_feature("register_tool");
-                }
-                let mut submodule = make_submodule(
-                    &t.ast_context,
-                    mod_item_store,
-                    *file_id,
-                    &mut new_uses,
-                    &t.mod_names,
-                    tcfg.reorganize_definitions,
-                );
-                let comments = t.comment_context.get_remaining_comments(*file_id);
-                submodule.set_span(match t.comment_store.borrow_mut().add_comments(&comments) {
-                    Some(pos) => submodule.span().with_hi(pos),
-                    None => submodule.span(),
-                });
-                mod_items.push(submodule);
-            }
-        }
-
-        // Main file item store
-        let (items, foreign_items, uses) = t.items.borrow_mut()[&t.main_file].drain();
-
-        // Re-order comments
-        // FIXME: We shouldn't have to replace with an empty comment store here, that's bad design
-        let traverser = t
-            .comment_store
-            .replace(CommentStore::new())
-            .into_comment_traverser();
-
-        /*
-        // Add a comment mapping span to each node that should have a
-        // comment printed before it. The pretty printer picks up these
-        // spans and uses them to decide when to emit comments.
-        mod_items = mod_items
-            .into_iter()
-            .map(|i| traverser.traverse_item(*i)).map(Box::new)
-            .collect();
-        let foreign_items: Vec<ForeignItem> = foreign_items
-            .into_iter()
-            .map(|fi| traverser.traverse_foreign_item(fi))
-            .collect();
-        let items: Vec<Box<Item>> = items
-            .into_iter()
-            .map(|i| traverser.traverse_item(*i)).map(Box::new)
-            .collect();
-        */
-
-        let mut reordered_comment_store = traverser.into_comment_store();
-        let remaining_comments = t.comment_context.get_remaining_comments(t.main_file);
-        reordered_comment_store.add_comments(&remaining_comments);
-
-        // We need a dummy SourceMap with a dummy file so that pprust can try to
-        // look up source line numbers for Spans. This is needed to be able to
-        // print trailing comments after exprs/stmts/etc. on the same line. The
-        // SourceMap will think that all Spans are invalid, but will return line
-        // 0 for all of them.
-
-        // FIXME: Use or delete this code
-        // let comments = Comments::new(reordered_comment_store.into_comments());
-
-        // pass all converted items to the Rust pretty printer
-        let translation = pprust::to_string(|| {
-            let (attrs, mut all_items) = arrange_header(&t, t.tcfg.is_binary(main_file.as_path()));
-
-            all_items.extend(mod_items);
-
-            // This could have been merged in with items below; however, it's more idiomatic to have
-            // imports near the top of the file than randomly scattered about. Also, there is probably
-            // no reason to have comments associated with imports so it doesn't need to go through
-            // the above comment store process
-            all_items.extend(uses.into_items());
-
-            // Print new uses from submodules
-            let (_, _, new_uses) = new_uses.drain();
-            all_items.extend(new_uses.into_items());
-
-            if !foreign_items.is_empty() {
-                all_items.push(mk().extern_("C").foreign_items(foreign_items));
-            }
-
-            // Add the items accumulated
-            all_items.extend(items);
-
-            //s.print_remaining_comments();
-            syn::File {
-                shebang: None,
-                attrs,
-                items: all_items.into_iter().map(|x| *x).collect(),
-            }
-        });
-        (translation, pragmas, crates)
     }
+
+    // Add the main entry point
+    if let Some(main_id) = t.ast_context.c_main {
+        match t.convert_main(main_id) {
+            Ok(item) => t.items.borrow_mut()[&t.main_file].add_item(item),
+            Err(e) => {
+                let msg = format!("Failed to translate main: {}", e);
+                translate_failure(t.tcfg, &msg)
+            }
+        }
+    }
+
+    // Initialize global statics when necessary
+    if !t.sectioned_static_initializers.borrow().is_empty() {
+        let (initializer_fn, initializer_static) = t.generate_global_static_init();
+        let store = &mut t.items.borrow_mut()[&t.main_file];
+
+        store.add_item(initializer_fn);
+        store.add_item(initializer_static);
+    }
+
+    let pragmas = t.get_pragmas();
+    let crates = t.extern_crates.borrow().clone();
+
+    let mut mod_items: Vec<Box<Item>> = Vec::new();
+
+    // Keep track of new uses we need while building header submodules
+    let mut new_uses = ItemStore::new();
+
+    // Header Reorganization: Submodule Item Stores
+    for (file_id, ref mut mod_item_store) in t.items.borrow_mut().iter_mut() {
+        if *file_id != t.main_file {
+            if tcfg.reorganize_definitions {
+                t.use_feature("register_tool");
+            }
+            let mut submodule = make_submodule(
+                &t.ast_context,
+                mod_item_store,
+                *file_id,
+                &mut new_uses,
+                &t.mod_names,
+                tcfg.reorganize_definitions,
+            );
+            let comments = t.comment_context.get_remaining_comments(*file_id);
+            submodule.set_span(match t.comment_store.borrow_mut().add_comments(&comments) {
+                Some(pos) => submodule.span().with_hi(pos),
+                None => submodule.span(),
+            });
+            mod_items.push(submodule);
+        }
+    }
+
+    // Main file item store
+    let (items, foreign_items, uses) = t.items.borrow_mut()[&t.main_file].drain();
+
+    // Re-order comments
+    // FIXME: We shouldn't have to replace with an empty comment store here, that's bad design
+    let traverser = t
+        .comment_store
+        .replace(CommentStore::new())
+        .into_comment_traverser();
+
+    /*
+    // Add a comment mapping span to each node that should have a
+    // comment printed before it. The pretty printer picks up these
+    // spans and uses them to decide when to emit comments.
+    mod_items = mod_items
+        .into_iter()
+        .map(|i| traverser.traverse_item(*i)).map(Box::new)
+        .collect();
+    let foreign_items: Vec<ForeignItem> = foreign_items
+        .into_iter()
+        .map(|fi| traverser.traverse_foreign_item(fi))
+        .collect();
+    let items: Vec<Box<Item>> = items
+        .into_iter()
+        .map(|i| traverser.traverse_item(*i)).map(Box::new)
+        .collect();
+    */
+
+    let mut reordered_comment_store = traverser.into_comment_store();
+    let remaining_comments = t.comment_context.get_remaining_comments(t.main_file);
+    reordered_comment_store.add_comments(&remaining_comments);
+
+    // We need a dummy SourceMap with a dummy file so that pprust can try to
+    // look up source line numbers for Spans. This is needed to be able to
+    // print trailing comments after exprs/stmts/etc. on the same line. The
+    // SourceMap will think that all Spans are invalid, but will return line
+    // 0 for all of them.
+
+    // FIXME: Use or delete this code
+    // let comments = Comments::new(reordered_comment_store.into_comments());
+
+    // pass all converted items to the Rust pretty printer
+    let translation = pprust::to_string(|| {
+        let (attrs, mut all_items) = arrange_header(&t, t.tcfg.is_binary(main_file.as_path()));
+
+        all_items.extend(mod_items);
+
+        // This could have been merged in with items below; however, it's more idiomatic to have
+        // imports near the top of the file than randomly scattered about. Also, there is probably
+        // no reason to have comments associated with imports so it doesn't need to go through
+        // the above comment store process
+        all_items.extend(uses.into_items());
+
+        // Print new uses from submodules
+        let (_, _, new_uses) = new_uses.drain();
+        all_items.extend(new_uses.into_items());
+
+        if !foreign_items.is_empty() {
+            all_items.push(mk().extern_("C").foreign_items(foreign_items));
+        }
+
+        // Add the items accumulated
+        all_items.extend(items);
+
+        //s.print_remaining_comments();
+        syn::File {
+            shebang: None,
+            attrs,
+            items: all_items.into_iter().map(|x| *x).collect(),
+        }
+    });
+    (translation, pragmas, crates)
 }
 
 fn item_ident(i: &Item) -> Option<&Ident> {
@@ -1581,6 +1572,7 @@ impl<'c> Translation<'c> {
                 integral_type: None,
                 ..
             } => {
+                todo!();
                 self.use_feature("extern_types");
                 let name = self
                     .type_converter
@@ -1628,6 +1620,7 @@ impl<'c> Translation<'c> {
                 }
 
                 // Gather up all the field names and field types
+                // TODO: Make sure it has the right behaviour
                 let (field_entries, contains_va_list) =
                     self.convert_struct_fields(decl_id, fields, platform_byte_size)?;
 
@@ -2406,9 +2399,7 @@ impl<'c> Translation<'c> {
                     // specifies internal linkage in all other cases due to name mangling by rustc.
                 }
 
-                Ok(ConvertedDecl::Item(
-                    mk_.span(span).unsafe_().fn_item(decl, block),
-                ))
+                Ok(ConvertedDecl::Item(mk_.span(span).fn_item(decl, block)))
             } else {
                 // Translating an extern function declaration
 
