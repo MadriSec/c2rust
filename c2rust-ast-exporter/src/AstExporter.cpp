@@ -495,6 +495,12 @@ class TypeEncoder final : public TypeVisitor<TypeEncoder> {
     }
 
     void VisitPointerType(const clang::PointerType *T) {
+        // Can we run analysis here ? We basically would like to know if the pointer is used as (can be multiple things at a time):
+        // - A reference to a single value/data structure,
+        // - A way to index an array,
+        // - A heap allocation
+        // - Type casting
+        // - Aliasing, constructing complex data structures.
         auto pointee = T->getPointeeType();
         auto qt = encodeQualType(pointee);
 
@@ -1956,10 +1962,11 @@ class TranslateASTVisitor final
 
         auto is_externally_visible = VD->isExternallyVisible();
 
+        auto initializer = 
         // Non static (externally visible) non definitions shouldn't receive an initializer,
         // otherwise get one
         if (!(is_externally_visible && !is_defn)) {
-            childIds.push_back((void *)VD->getAnyInitializer());
+            childIds.push_back((void *)initializer);
         }
 
         // Use the type from the definition in case the extern was an incomplete

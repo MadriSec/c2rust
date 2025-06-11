@@ -261,6 +261,7 @@ impl TypeConverter {
         ctxt: &TypedAstContext,
         qtype: CQualTypeId,
     ) -> TranslationResult<Box<Type>> {
+        // TODO: refine this. Do the same thing as krml ?
         let mutbl = if qtype.qualifiers.is_const {
             Mutability::Immutable
         } else {
@@ -276,6 +277,7 @@ impl TypeConverter {
                 .set_mutbl(mutbl)
                 .ptr_ty(mk().path_ty(vec!["std", "ffi", "c_void"]))),
 
+            // This should clearly be a Vec
             CTypeKind::VariableArray(mut elt, _len) => {
                 while let CTypeKind::VariableArray(elt_, _) = ctxt.resolve_type(elt).kind {
                     elt = elt_
@@ -286,21 +288,25 @@ impl TypeConverter {
 
             // Function pointers are translated to Option applied to the function type
             // in order to support NULL function pointers natively
+            // TODO: Figure out how they are managed
             CTypeKind::Function(..) => {
-                println!("WHAT IS THIS");
                 let fn_ty = self.convert(ctxt, qtype.ctype)?;
                 let param = mk().angle_bracketed_args(vec![fn_ty]);
                 Ok(mk().path_ty(vec![mk().path_segment_with_args("Option", param)]))
             }
 
+            // What happens when there is an array decay, but also a function decay. Array decays should be treated as references most of the time.
+            CTypeKind::Decayed(ctype_id) => {
+                todo!()
+            }
+
             _ => {
-                // This Should be an &[T] according to IRIA people
+                // This Should be an &[T] according to IRIA people, most of the time. The thing is we want to refine the C ast, not the rust one.
+                println!("{:?}", ctxt.resolve_type(qtype.ctype).kind);
                 let child_ty = self.convert(ctxt, qtype.ctype)?;
-                println!("{child_ty:?}");
-                Ok(mk().set_mutbl(mutbl).ptr_ty(child_ty))
+                Ok(mk().set_mutbl(mutbl).ref_ty(child_ty))
             }
         };
-        todo!();
         res
     }
 

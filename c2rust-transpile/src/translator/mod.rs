@@ -4355,7 +4355,6 @@ impl<'c> Translation<'c> {
                                     mk().cast_expr(val, ptr_type)
                                 }));
                             }
-
                             Ok(call)
                         }
                     }
