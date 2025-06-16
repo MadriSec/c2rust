@@ -9,6 +9,10 @@
 **/instrument.target/
 **/tests/
 /build
+*/build
+/.cache
+*/.cache
+*/*/.cache
 *.pyc
 .vagrant
 **/compile_commands.json

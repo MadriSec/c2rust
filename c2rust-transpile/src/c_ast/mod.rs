@@ -577,10 +577,11 @@ impl TypedAstContext {
                     is_global: true,
                     is_inline,
                     is_inline_externally_visible,
+                    ref name,
                     ..
                     // Depending on the C specification and dialect, an inlined function
                     // may be externally visible. We rely on clang to determine visibility.
-                } if !is_inline || is_inline_externally_visible => true,
+                } if !is_inline || is_inline_externally_visible => (name != "malloc"),
                 Function {
                     body: Some(_),
                     ..
@@ -1716,6 +1717,7 @@ impl CTypeKind {
             Half => "half",
             BFloat16 => "bfloat16",
             Float128 => "__float128",
+            Struct(_) => "SomeStructure",
             _ => unimplemented!("Printer::print_type({:?})", self),
         }
     }

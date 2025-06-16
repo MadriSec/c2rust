@@ -302,9 +302,8 @@ impl TypeConverter {
 
             _ => {
                 // This Should be an &[T] according to IRIA people, most of the time. The thing is we want to refine the C ast, not the rust one.
-                println!("{:?}", ctxt.resolve_type(qtype.ctype).kind);
                 let child_ty = self.convert(ctxt, qtype.ctype)?;
-                Ok(mk().set_mutbl(mutbl).ref_ty(child_ty))
+                Ok(mk().set_mutbl(mutbl).ptr_ty(child_ty))
             }
         };
         res
