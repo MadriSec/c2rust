@@ -8,12 +8,16 @@
 #include <unordered_set>
 #include <vector>
 
+#include "clang/AST/Decl.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/Path.h"
 // Declares clang::SyntaxOnlyAction.
 #include "clang/Frontend/FrontendActions.h"
 #include "clang/Tooling/CommonOptionsParser.h"
+
+#include "clang/ASTMatchers/ASTMatchFinder.h"
+#include "clang/ASTMatchers/ASTMatchers.h"
 
 #include "clang/AST/DeclVisitor.h"
 #include "clang/AST/RecordLayout.h"
@@ -41,6 +45,7 @@
 using namespace llvm;
 using namespace clang;
 using namespace clang::tooling;
+using namespace clang::ast_matchers;
 
 #define DEBUG_TYPE "c2rust-ast-exporter"
 
@@ -557,6 +562,32 @@ class TypeEncoder final : public TypeVisitor<TypeEncoder> {
     }
 };
 
+clang::ast_matchers::DeclarationMatcher MallocMatcher =
+    varDecl(hasInitializer(ignoringImpCasts(
+                callExpr(callee(functionDecl(hasName("malloc"))))
+                    .bind("mallocCall"))))
+        .bind("mallocInit");
+
+class PatternExporter : public clang::ast_matchers::MatchFinder::MatchCallback {
+  public:
+    TranslateASTVisitor *astEncoder;
+
+    void markForExport(void *VD);
+
+    explicit PatternExporter(TranslateASTVisitor *astEncoder)
+        : astEncoder(astEncoder) {};
+
+    virtual void
+    run(const clang::ast_matchers::MatchFinder::MatchResult &Result) {
+        if (const VarDecl *VD =
+                Result.Nodes.getNodeAs<clang::VarDecl>("mallocInit")) {
+            VD->dump();
+
+            markForExport((void *)VD);
+        }
+    }
+};
+
 class TranslateASTVisitor final
     : public RecursiveASTVisitor<TranslateASTVisitor> {
 
@@ -571,7 +602,9 @@ class TranslateASTVisitor final
     std::vector<std::pair<string, SourceLocation>> files;
     // Mapping from SourceManager FileID to index in files
     DenseMap<FileID, size_t> file_id_mapping;
+
     std::set<std::pair<void *, ASTEntryTag>> exportedTags;
+
     std::unordered_map<MacroInfo *, MacroExpansionInfo> macros;
 
     // This stores a raw encoding of the macro call site SourceLocation, since
@@ -580,6 +613,7 @@ class TranslateASTVisitor final
     SmallVector<MacroInfo *, 1> curMacroExpansionStack;
     StringRef curMacroExpansionSource;
 
+  public:
     // Returns true when a new entry is added to exportedTags
     bool markForExport(void *ptr, ASTEntryTag tag) {
         return exportedTags.emplace(ptr, tag).second;
@@ -817,13 +851,19 @@ class TranslateASTVisitor final
         }
     }
 
-  public:
+    //   public:
     explicit TranslateASTVisitor(ASTContext *Context, CborEncoder *encoder,
                                  std::unordered_map<void *, QualType> *sugared,
                                  Preprocessor &PP)
         : Context(Context), typeEncoder(Context, encoder, sugared, this),
           encoder(encoder), PP(PP), files{{"", {}}} {}
 
+    void ApplyMatches() {
+        PatternExporter pattern_exporter = PatternExporter(this);
+        MatchFinder Finder;
+        Finder.addMatcher(MallocMatcher, &pattern_exporter);
+        Finder.matchAST(*Context);
+    }
     // Override the default behavior of the RecursiveASTVisitor
     bool shouldVisitImplicitCode() const { return true; }
 
@@ -1972,7 +2012,7 @@ class TranslateASTVisitor final
         auto is_externally_visible = VD->isExternallyVisible();
 
         auto initializer = VD->getAnyInitializer();
-        // initializer->dump();
+
         // Non static (externally visible) non definitions shouldn't receive an
         // initializer, otherwise get one
         if (!(is_externally_visible && !is_defn)) {
@@ -2495,6 +2535,10 @@ class TranslateASTVisitor final
     }
 };
 
+void PatternExporter::markForExport(void *VD) {
+    astEncoder->markForExport(VD, TagVarDecl);
+}
+
 void TypeEncoder::VisitEnumType(const EnumType *T) {
     auto ed = T->getDecl()->getDefinition();
     encodeType(T, TagEnumType, [T, ed](CborEncoder *local) {
@@ -2600,9 +2644,12 @@ class TranslateConsumer : public clang::ASTConsumer {
             CborEncoder array;
 
             // 1. Encode all of the reachable AST nodes and types
+
+            // Look at this
             cbor_encoder_create_array(&outer, &array, CborIndefiniteLength);
             TranslateASTVisitor visitor(&Context, &array, &sugared, PP);
             auto translation_unit = Context.getTranslationUnitDecl();
+            visitor.ApplyMatches();
             visitor.TraverseDecl(translation_unit);
             visitor.encodeMacros();
             cbor_encoder_close_container(&outer, &array);

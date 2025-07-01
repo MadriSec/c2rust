@@ -581,7 +581,7 @@ impl TypedAstContext {
                     ..
                     // Depending on the C specification and dialect, an inlined function
                     // may be externally visible. We rely on clang to determine visibility.
-                } if !is_inline || is_inline_externally_visible => (name != "malloc"),
+                } if !is_inline || is_inline_externally_visible => name != "malloc",
                 Function {
                     body: Some(_),
                     ..
