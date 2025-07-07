@@ -1806,7 +1806,7 @@ impl ConversionContext {
                     let is_extern =
                         from_value(node.extras[5].clone()).expect("Expected to find externness");
                     let is_inline_externally_visible = from_value(node.extras[6].clone())
-                        .expect("Expected to find inline visibliity");
+                        .expect("Expected to find inline visibility");
                     let attributes = from_value::<Vec<Value>>(node.extras[7].clone())
                         .expect("Expected to find attributes");
                     let attrs = parse_attributes(attributes);
@@ -1933,6 +1933,9 @@ impl ConversionContext {
                         .expect("Expected to find whether decl is definition");
                     let attributes = from_value::<Vec<Value>>(node.extras[5].clone())
                         .expect("Expected attribute array on var decl");
+                    // Add here the malloced initialized information
+                    let result: u8 = from_value(node.extras[6].clone())
+                        .expect("Should contain malloc information");
 
                     assert!(
                         has_static_duration || has_thread_duration || !is_externally_visible,
@@ -1964,6 +1967,7 @@ impl ConversionContext {
                         initializer,
                         typ,
                         attrs,
+                        is_malloc_initialized: result == 1u8,
                     };
 
                     self.add_decl(new_id, located(node, variable_decl));

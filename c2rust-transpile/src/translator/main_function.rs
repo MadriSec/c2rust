@@ -225,7 +225,6 @@ impl<'c> Translation<'c> {
             };
 
             if let CTypeKind::Void = ret {
-                todo!();
                 let call_main = mk().call_expr(main_fn, main_args);
                 let unsafe_block = mk().unsafe_block(vec![mk().expr_stmt(call_main)]);
 

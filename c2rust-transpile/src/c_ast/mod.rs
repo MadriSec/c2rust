@@ -927,6 +927,7 @@ pub enum CDeclKind {
         initializer: Option<CExprId>,
         typ: CQualTypeId,
         attrs: IndexSet<Attribute>,
+        is_malloc_initialized: bool,
     },
 
     // Enum (http://clang.llvm.org/doxygen/classclang_1_1EnumDecl.html)

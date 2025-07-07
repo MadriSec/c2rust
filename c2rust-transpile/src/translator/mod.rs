@@ -1572,7 +1572,6 @@ impl<'c> Translation<'c> {
                 integral_type: None,
                 ..
             } => {
-                todo!();
                 self.use_feature("extern_types");
                 let name = self
                     .type_converter
@@ -2673,6 +2672,7 @@ impl<'c> Translation<'c> {
                 ref ident,
                 initializer,
                 typ,
+                is_malloc_initialized,
                 ..
             } => {
                 assert!(
@@ -2710,8 +2710,11 @@ impl<'c> Translation<'c> {
 
                 let mut stmts = self.compute_variable_array_sizes(ctx, typ.ctype)?;
 
-                let ConvertedVariable { ty, mutbl, init } =
-                    self.convert_variable(ctx, initializer, typ)?;
+                let ConvertedVariable { ty, mutbl, init } = if is_malloc_initialized {
+                    self.convert_heap_variable(typ)?
+                } else {
+                    self.convert_variable(ctx, initializer, typ)?
+                };
                 let mut init = init?;
 
                 stmts.append(init.stmts_mut());
@@ -2719,6 +2722,7 @@ impl<'c> Translation<'c> {
 
                 let zeroed = self.implicit_default_expr(typ.ctype, false)?;
                 let zeroed = if ctx.is_const {
+                    // This is where const is taken into account
                     zeroed.to_unsafe_pure_expr()
                 } else {
                     zeroed.to_pure_expr()
@@ -2790,25 +2794,24 @@ impl<'c> Translation<'c> {
                 };
 
                 if skip {
-                    Ok(cfg::DeclStmtInfo::new(vec![], vec![], vec![]))
-                } else {
-                    use ConvertedDecl::*;
-                    let items = match self.convert_decl(ctx, decl_id)? {
-                        Item(item) => vec![item],
-                        ForeignItem(item) => {
-                            vec![mk().extern_("C").foreign_items(vec![*item])]
-                        }
-                        Items(items) => items,
-                        NoItem => return Ok(cfg::DeclStmtInfo::empty()),
-                    };
-
-                    let item_stmt = |item| mk().item_stmt(item);
-                    Ok(cfg::DeclStmtInfo::new(
-                        items.iter().cloned().map(item_stmt).collect(),
-                        vec![],
-                        items.into_iter().map(item_stmt).collect(),
-                    ))
+                    return Ok(cfg::DeclStmtInfo::new(vec![], vec![], vec![]));
                 }
+                use ConvertedDecl::*;
+                let items = match self.convert_decl(ctx, decl_id)? {
+                    Item(item) => vec![item],
+                    ForeignItem(item) => {
+                        vec![mk().extern_("C").foreign_items(vec![*item])]
+                    }
+                    Items(items) => items,
+                    NoItem => return Ok(cfg::DeclStmtInfo::empty()),
+                };
+
+                let item_stmt = |item| mk().item_stmt(item);
+                Ok(cfg::DeclStmtInfo::new(
+                    items.iter().cloned().map(item_stmt).collect(),
+                    vec![],
+                    items.into_iter().map(item_stmt).collect(),
+                ))
             }
         }
     }
@@ -2915,6 +2918,38 @@ impl<'c> Translation<'c> {
         } else {
             self.convert_type(typ.ctype)?
         };
+
+        let mutbl = if typ.qualifiers.is_const {
+            Mutability::Immutable
+        } else {
+            Mutability::Mutable
+        };
+
+        Ok(ConvertedVariable { ty, mutbl, init })
+    }
+
+    fn convert_heap_variable(&self, typ: CQualTypeId) -> TranslationResult<ConvertedVariable> {
+        let pointee_ctype = match self.ast_context.resolve_type(typ.ctype).kind {
+            CTypeKind::Pointer(pt) => pt,
+            _ => return Err("Heap variable is not a C pointer".into()),
+        };
+
+        let init = {
+            match self.implicit_default_expr(pointee_ctype.ctype, true) {
+                Ok(default) => Ok(WithStmts::new_val(mk().call_expr(
+                    mk().path_expr(vec!["Box", "new"]),
+                    vec![default.into_value()],
+                ))),
+                Err(e) => Err(e),
+            }
+        };
+
+        let pointee_ty = self.convert_type(pointee_ctype.ctype)?;
+        let ty =
+            mk().path_ty(vec![mk().path_segment_with_args(
+                "Box",
+                mk().angle_bracketed_args(vec![pointee_ty]),
+            )]);
 
         let mutbl = if typ.qualifiers.is_const {
             Mutability::Immutable
@@ -3711,6 +3746,9 @@ impl<'c> Translation<'c> {
                             })?,
                         )
                         .map(|ty| &self.ast_context.resolve_type(ty.ctype).kind);
+                let toto = &self.ast_context[func].to_owned().kind;
+                let mut is_external = false;
+                println!("callee func kind: {:?}", toto);
                 let is_variadic = match fn_ty {
                     Some(CTypeKind::Function(_, _, is_variadic, _, _)) => *is_variadic,
                     _ => false,
@@ -3722,7 +3760,19 @@ impl<'c> Translation<'c> {
                     // callee is a declref
                     if matches!(self.ast_context[fexp].kind, CExprKind::DeclRef(..)) =>
                         {
-                            self.convert_expr(ctx.used(), fexp)?
+                            let decl = match self.ast_context[fexp].kind {
+                                CExprKind::DeclRef(_, decl, _) => &self.ast_context[decl],
+                                _ => unreachable!()
+                            };
+                            is_external = match decl.kind {
+                                CDeclKind::Function { is_extern,.. } => is_extern,
+                                _ => unreachable!()
+                            };
+                            let mut res = self.convert_expr(ctx.used(), fexp)?;
+                            if is_external {
+                                res.set_unsafe();
+                            }
+                            res
                         }
 
                     // Builtin function call
@@ -3735,13 +3785,18 @@ impl<'c> Translation<'c> {
                         let callee = self.convert_expr(ctx.used(), func)?;
                         let make_fn_ty = |ret_ty: Box<Type>| {
                             let ret_ty = match *ret_ty {
-                                Type::Tuple(TypeTuple { elems: ref v, .. }) if v.is_empty() => ReturnType::Default,
+                                Type::Tuple(TypeTuple { elems: ref v, .. }) if v.is_empty() => {
+                                    ReturnType::Default
+                                }
                                 _ => ReturnType::Type(Default::default(), ret_ty),
                             };
                             let bare_ty = (
-                                vec![mk().bare_arg(mk().infer_ty(), None::<Box<Ident>>); args.len()],
+                                vec![
+                                    mk().bare_arg(mk().infer_ty(), None::<Box<Ident>>);
+                                    args.len()
+                                ],
                                 None::<Variadic>,
-                                ret_ty
+                                ret_ty,
                             );
                             mk().barefn_ty(bare_ty)
                         };
@@ -3771,7 +3826,7 @@ impl<'c> Translation<'c> {
                     }
                 };
 
-                let call = func.and_then(|func| {
+                let mut call = func.and_then(|func| {
                     // We want to decay refs only when function is variadic
                     ctx.decay_ref = DecayRef::from(is_variadic);
 
@@ -3781,6 +3836,16 @@ impl<'c> Translation<'c> {
                     res
                 })?;
 
+                if is_external {
+                    call = WithStmts::new(
+                        vec![],
+                        mk().unsafe_block_expr(
+                            mk().unsafe_block(vec![mk().expr_stmt(call.into_value())]),
+                        ),
+                    );
+                }
+
+                println!("{:?}", call);
                 self.convert_side_effects_expr(
                     ctx,
                     call,

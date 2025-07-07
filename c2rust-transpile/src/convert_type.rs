@@ -296,10 +296,9 @@ impl TypeConverter {
             }
 
             // What happens when there is an array decay, but also a function decay. Array decays should be treated as references most of the time.
-            CTypeKind::Decayed(ctype_id) => {
-                todo!()
-            }
-
+            // CTypeKind::Decayed(ctype_id) => {
+            //     todo!()
+            // }
             _ => {
                 // This Should be an &[T] according to IRIA people, most of the time. The thing is we want to refine the C ast, not the rust one.
                 let child_ty = self.convert(ctxt, qtype.ctype)?;
@@ -322,7 +321,7 @@ impl TypeConverter {
         }
 
         match ctxt.index(ctype).kind {
-            // Not sure about some of these translations, but ffi seems ugly.
+            // Not sure about some of these translations, but ffi seems ugly. (Using the Rust basic types breaks semantic equivalence though)
             CTypeKind::Void => Ok(mk().tuple_ty(vec![])),
             CTypeKind::Bool => Ok(mk().path_ty(mk().path(vec!["bool"]))),
             CTypeKind::Short => Ok(mk().path_ty(mk().path(vec!["i16"]))),

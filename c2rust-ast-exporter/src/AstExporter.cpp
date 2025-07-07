@@ -1,14 +1,19 @@
 #include <algorithm>
+#include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <llvm-14/llvm/ADT/Optional.h>
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "clang/AST/Decl.h"
+#include "clang/AST/Type.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/Path.h"
@@ -170,6 +175,8 @@ class TypeEncoder final : public TypeVisitor<TypeEncoder> {
     }
 
   public:
+    // Should this be where memory allocation is stored ? This is kind of what
+    // we'd like, qualify pointers
     uintptr_t encodeQualType(QualType t) {
         auto s = t.split();
 
@@ -199,15 +206,17 @@ class TypeEncoder final : public TypeVisitor<TypeEncoder> {
           astEncoder(ast) {}
 
     void VisitQualType(const QualType &QT) {
-        if (!QT.isNull()) {
-            auto s = QT.split();
+        if (QT.isNull()) {
+            return;
+        }
 
-            auto desugared = sugared->find((void *)s.Ty);
-            if (desugared != sugared->end())
-                VisitQualType(desugared->second);
-            else if (!isExported(s.Ty)) {
-                Visit(s.Ty);
-            }
+        auto s = QT.split();
+
+        auto desugared = sugared->find((void *)s.Ty);
+        if (desugared != sugared->end())
+            VisitQualType(desugared->second);
+        else if (!isExported(s.Ty)) {
+            Visit(s.Ty);
         }
     }
 
@@ -497,13 +506,15 @@ class TypeEncoder final : public TypeVisitor<TypeEncoder> {
     }
 
     void VisitPointerType(const clang::PointerType *T) {
-        // Can we run analysis here ? We basically would like to know if the
-        // pointer is used as (can be multiple things at a time):
+        // Can we run analysis here ? -> No, best we can do is pass through
+        // information We basically would like to know if the pointer is used as
+        // (can be multiple things at a time):
         // - A reference to a single value/data structure,
         // - A way to index an array,
-        // - A heap allocation
+        // - A heap allocation (work in progress)
         // - Type casting
         // - Aliasing, constructing complex data structures.
+        // T->dump();
         auto pointee = T->getPointeeType();
         auto qt = encodeQualType(pointee);
 
@@ -564,7 +575,8 @@ class TypeEncoder final : public TypeVisitor<TypeEncoder> {
 
 clang::ast_matchers::DeclarationMatcher MallocMatcher =
     varDecl(hasInitializer(ignoringImpCasts(
-                callExpr(callee(functionDecl(hasName("malloc"))))
+                callExpr(callee(functionDecl(hasName("malloc"))),
+                         hasArgument(0, sizeOfExpr(unaryExprOrTypeTraitExpr())))
                     .bind("mallocCall"))))
         .bind("mallocInit");
 
@@ -572,7 +584,7 @@ class PatternExporter : public clang::ast_matchers::MatchFinder::MatchCallback {
   public:
     TranslateASTVisitor *astEncoder;
 
-    void markForExport(void *VD);
+    bool set_analysis_results(void *node, uint8_t results);
 
     explicit PatternExporter(TranslateASTVisitor *astEncoder)
         : astEncoder(astEncoder) {};
@@ -581,9 +593,11 @@ class PatternExporter : public clang::ast_matchers::MatchFinder::MatchCallback {
     run(const clang::ast_matchers::MatchFinder::MatchResult &Result) {
         if (const VarDecl *VD =
                 Result.Nodes.getNodeAs<clang::VarDecl>("mallocInit")) {
-            VD->dump();
+            // VD->dump();
 
-            markForExport((void *)VD);
+            if (!set_analysis_results((void *)VD, 1)) {
+                std::cerr << "Variable was not successfully inserted :/\n";
+            };
         }
     }
 };
@@ -606,6 +620,10 @@ class TranslateASTVisitor final
     std::set<std::pair<void *, ASTEntryTag>> exportedTags;
 
     std::unordered_map<MacroInfo *, MacroExpansionInfo> macros;
+
+    // This stores analysis information gathered from matchers, but also
+    // ultimately from static analysis
+    std::unordered_map<void *, uint8_t> analysis_results;
 
     // This stores a raw encoding of the macro call site SourceLocation, since
     // SourceLocation isn't hashable.
@@ -856,13 +874,27 @@ class TranslateASTVisitor final
                                  std::unordered_map<void *, QualType> *sugared,
                                  Preprocessor &PP)
         : Context(Context), typeEncoder(Context, encoder, sugared, this),
-          encoder(encoder), PP(PP), files{{"", {}}} {}
-
-    void ApplyMatches() {
+          encoder(encoder), PP(PP), files{{"", {}}} {
         PatternExporter pattern_exporter = PatternExporter(this);
         MatchFinder Finder;
         Finder.addMatcher(MallocMatcher, &pattern_exporter);
         Finder.matchAST(*Context);
+    }
+
+    /// Add analysis to an AST node, which should be looked up by Visit*() to
+    /// add into the 'extra'
+    bool set_analysis_results(void *ast_node, uint8_t results) {
+        return analysis_results.emplace(ast_node, results).second;
+    }
+
+    /// Get the analysis results of a node if present.
+    Optional<uint8_t> get_analysis_results(void *ast_node) {
+        auto res = analysis_results.find(ast_node);
+        if (res != analysis_results.end()) {
+            return res->second;
+        } else {
+            return {};
+        }
     }
     // Override the default behavior of the RecursiveASTVisitor
     bool shouldVisitImplicitCode() const { return true; }
@@ -2022,6 +2054,18 @@ class TranslateASTVisitor final
         // Use the type from the definition in case the extern was an incomplete
         // type
         auto T = def->getType();
+
+        // This seems like a really good way to add pointer location
+        // information, but is relly limited (3 bits of qualifiers, (const,
+        // volatile, restrict) clang exits if it sees more). We'd like to make
+        // the TypeEncoder get the info, but function signatures don't really
+        // allow that.
+
+        // T.addFastQualifiers(0xf); // This panics
+        // def->setType(T);
+
+        // def->dump();
+
         if (isa<AtomicType>(T)) {
             printC11AtomicError(def);
             abort();
@@ -2029,9 +2073,16 @@ class TranslateASTVisitor final
 
         auto loc = is_defn ? def->getLocation() : VD->getLocation();
 
+        // Optional is defaulted to zero for now, but could be something else if
+        // the default value is different.
+        uint8_t analysis_result =
+            get_analysis_results((void *)VD).getValueOr(0);
+        bool is_malloc = analysis_result == 1;
+
         encode_entry(
             VD, TagVarDecl, loc, childIds, T,
-            [VD, is_defn, def, is_externally_visible](CborEncoder *array) {
+            [VD, is_defn, def, is_externally_visible,
+             is_malloc](CborEncoder *array) {
                 auto name = VD->getNameAsString();
                 cbor_encode_string(array, name);
 
@@ -2069,8 +2120,8 @@ class TranslateASTVisitor final
                         }
                     }
                 }
-
                 cbor_encoder_close_container(array, &attr_info);
+                cbor_encode_uint(array, is_malloc);
             });
 
         typeEncoder.VisitQualType(T);
@@ -2535,8 +2586,12 @@ class TranslateASTVisitor final
     }
 };
 
-void PatternExporter::markForExport(void *VD) {
-    astEncoder->markForExport(VD, TagVarDecl);
+// This way of accessing calls to the translateASTVisitor is not really needed
+// if we directly do things to the analysis results map, and load it during
+// construction. The basic idea is that translation should only occurs after
+// analysis.
+bool PatternExporter::set_analysis_results(void *ast_node, uint8_t results) {
+    return astEncoder->set_analysis_results(ast_node, results);
 }
 
 void TypeEncoder::VisitEnumType(const EnumType *T) {
@@ -2649,7 +2704,6 @@ class TranslateConsumer : public clang::ASTConsumer {
             cbor_encoder_create_array(&outer, &array, CborIndefiniteLength);
             TranslateASTVisitor visitor(&Context, &array, &sugared, PP);
             auto translation_unit = Context.getTranslationUnitDecl();
-            visitor.ApplyMatches();
             visitor.TraverseDecl(translation_unit);
             visitor.encodeMacros();
             cbor_encoder_close_container(&outer, &array);
