@@ -2672,7 +2672,7 @@ impl<'c> Translation<'c> {
                 ref ident,
                 initializer,
                 typ,
-                is_malloc_initialized,
+                heap_info,
                 ..
             } => {
                 assert!(
@@ -2710,7 +2710,7 @@ impl<'c> Translation<'c> {
 
                 let mut stmts = self.compute_variable_array_sizes(ctx, typ.ctype)?;
 
-                let ConvertedVariable { ty, mutbl, init } = if is_malloc_initialized {
+                let ConvertedVariable { ty, mutbl, init } = if heap_info.is_some() {
                     self.convert_heap_variable(typ)?
                 } else {
                     self.convert_variable(ctx, initializer, typ)?
@@ -3746,9 +3746,9 @@ impl<'c> Translation<'c> {
                             })?,
                         )
                         .map(|ty| &self.ast_context.resolve_type(ty.ctype).kind);
-                let toto = &self.ast_context[func].to_owned().kind;
+
                 let mut is_external = false;
-                println!("callee func kind: {:?}", toto);
+
                 let is_variadic = match fn_ty {
                     Some(CTypeKind::Function(_, _, is_variadic, _, _)) => *is_variadic,
                     _ => false,
@@ -3845,7 +3845,6 @@ impl<'c> Translation<'c> {
                     );
                 }
 
-                println!("{:?}", call);
                 self.convert_side_effects_expr(
                     ctx,
                     call,

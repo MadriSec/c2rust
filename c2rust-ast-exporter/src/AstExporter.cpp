@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -573,6 +574,34 @@ class TypeEncoder final : public TypeVisitor<TypeEncoder> {
     }
 };
 
+class HeapInfo {
+    size_t nb_elements;
+
+  public:
+    HeapInfo(size_t nb_elements) : nb_elements(nb_elements) {};
+    void encode(CborEncoder *encoder) {
+        cbor_encode_uint(encoder, nb_elements);
+    }
+};
+
+class AnalysisResult {
+    Optional<HeapInfo> heap_info;
+
+  public:
+    AnalysisResult() : heap_info({}) {};
+    AnalysisResult(HeapInfo hi) : heap_info(hi) {};
+    void encode(CborEncoder *encoder) {
+        CborEncoder local;
+        cbor_encoder_create_array(encoder, &local, CborIndefiniteLength);
+        if (heap_info.hasValue()) {
+            heap_info.getValue().encode(&local);
+        } else {
+            cbor_encode_null(&local);
+        }
+        cbor_encoder_close_container(encoder, &local);
+    }
+};
+
 clang::ast_matchers::DeclarationMatcher MallocMatcher =
     varDecl(hasInitializer(ignoringImpCasts(
                 callExpr(callee(functionDecl(hasName("malloc"))),
@@ -582,20 +611,22 @@ clang::ast_matchers::DeclarationMatcher MallocMatcher =
 
 class PatternExporter : public clang::ast_matchers::MatchFinder::MatchCallback {
   public:
-    TranslateASTVisitor *astEncoder;
+    // This stores analysis information gathered from matchers, but also
+    // ultimately from static analysis
+    std::unordered_map<void *, AnalysisResult> *analysis_results;
 
-    bool set_analysis_results(void *node, uint8_t results);
-
-    explicit PatternExporter(TranslateASTVisitor *astEncoder)
-        : astEncoder(astEncoder) {};
+    explicit PatternExporter(
+        std::unordered_map<void *, AnalysisResult> *results)
+        : analysis_results(results) {};
 
     virtual void
     run(const clang::ast_matchers::MatchFinder::MatchResult &Result) {
         if (const VarDecl *VD =
                 Result.Nodes.getNodeAs<clang::VarDecl>("mallocInit")) {
-            // VD->dump();
 
-            if (!set_analysis_results((void *)VD, 1)) {
+            if (!analysis_results
+                     ->emplace((void *)VD, AnalysisResult(HeapInfo(1)))
+                     .second) {
                 std::cerr << "Variable was not successfully inserted :/\n";
             };
         }
@@ -623,7 +654,7 @@ class TranslateASTVisitor final
 
     // This stores analysis information gathered from matchers, but also
     // ultimately from static analysis
-    std::unordered_map<void *, uint8_t> analysis_results;
+    std::unordered_map<void *, AnalysisResult> analysis_results;
 
     // This stores a raw encoding of the macro call site SourceLocation, since
     // SourceLocation isn't hashable.
@@ -875,20 +906,15 @@ class TranslateASTVisitor final
                                  Preprocessor &PP)
         : Context(Context), typeEncoder(Context, encoder, sugared, this),
           encoder(encoder), PP(PP), files{{"", {}}} {
-        PatternExporter pattern_exporter = PatternExporter(this);
+        PatternExporter pattern_exporter =
+            PatternExporter(&this->analysis_results);
         MatchFinder Finder;
         Finder.addMatcher(MallocMatcher, &pattern_exporter);
         Finder.matchAST(*Context);
     }
 
-    /// Add analysis to an AST node, which should be looked up by Visit*() to
-    /// add into the 'extra'
-    bool set_analysis_results(void *ast_node, uint8_t results) {
-        return analysis_results.emplace(ast_node, results).second;
-    }
-
     /// Get the analysis results of a node if present.
-    Optional<uint8_t> get_analysis_results(void *ast_node) {
+    Optional<AnalysisResult> get_analysis_results(void *ast_node) {
         auto res = analysis_results.find(ast_node);
         if (res != analysis_results.end()) {
             return res->second;
@@ -2073,16 +2099,13 @@ class TranslateASTVisitor final
 
         auto loc = is_defn ? def->getLocation() : VD->getLocation();
 
-        // Optional is defaulted to zero for now, but could be something else if
-        // the default value is different.
-        uint8_t analysis_result =
-            get_analysis_results((void *)VD).getValueOr(0);
-        bool is_malloc = analysis_result == 1;
+        AnalysisResult analysis_result =
+            get_analysis_results((void *)VD).getValueOr(AnalysisResult());
 
         encode_entry(
             VD, TagVarDecl, loc, childIds, T,
             [VD, is_defn, def, is_externally_visible,
-             is_malloc](CborEncoder *array) {
+             &analysis_result](CborEncoder *array) {
                 auto name = VD->getNameAsString();
                 cbor_encode_string(array, name);
 
@@ -2121,7 +2144,8 @@ class TranslateASTVisitor final
                     }
                 }
                 cbor_encoder_close_container(array, &attr_info);
-                cbor_encode_uint(array, is_malloc);
+
+                analysis_result.encode(array);
             });
 
         typeEncoder.VisitQualType(T);
@@ -2585,14 +2609,6 @@ class TranslateASTVisitor final
             CharSourceRange::getCharRange(S->getSourceRange()));
     }
 };
-
-// This way of accessing calls to the translateASTVisitor is not really needed
-// if we directly do things to the analysis results map, and load it during
-// construction. The basic idea is that translation should only occurs after
-// analysis.
-bool PatternExporter::set_analysis_results(void *ast_node, uint8_t results) {
-    return astEncoder->set_analysis_results(ast_node, results);
-}
 
 void TypeEncoder::VisitEnumType(const EnumType *T) {
     auto ed = T->getDecl()->getDefinition();

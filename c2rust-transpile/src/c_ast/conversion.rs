@@ -1933,9 +1933,15 @@ impl ConversionContext {
                         .expect("Expected to find whether decl is definition");
                     let attributes = from_value::<Vec<Value>>(node.extras[5].clone())
                         .expect("Expected attribute array on var decl");
-                    // Add here the malloced initialized information
-                    let result: u8 = from_value(node.extras[6].clone())
-                        .expect("Should contain malloc information");
+                    // Add here the malloced initialized information, and more in the future
+                    let analysis_result =
+                        from_value::<Vec<Value>>(node.extras[6].clone()).expect("Should contain ");
+
+                    let heap_info: Option<usize> =
+                        match from_value::<usize>(analysis_result[0].clone()) {
+                            Ok(nb_elements) => Some(nb_elements),
+                            Err(_) => None,
+                        };
 
                     assert!(
                         has_static_duration || has_thread_duration || !is_externally_visible,
@@ -1967,7 +1973,7 @@ impl ConversionContext {
                         initializer,
                         typ,
                         attrs,
-                        is_malloc_initialized: result == 1u8,
+                        heap_info,
                     };
 
                     self.add_decl(new_id, located(node, variable_decl));
