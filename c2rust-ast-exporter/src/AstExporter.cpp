@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "clang/AST/Decl.h"
+#include "clang/AST/DeclBase.h"
 #include "clang/AST/Type.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
@@ -605,9 +606,11 @@ class AnalysisResult {
 clang::ast_matchers::DeclarationMatcher MallocMatcher =
     varDecl(hasInitializer(ignoringImpCasts(
                 callExpr(callee(functionDecl(hasName("malloc"))),
-                         hasArgument(0, sizeOfExpr(unaryExprOrTypeTraitExpr())))
+                         hasArgument(0, sizeOfExpr(unaryExprOrTypeTraitExpr(
+                                            hasArgumentOfType(qualType().bind(
+                                                "declaredType"))))))
                     .bind("mallocCall"))))
-        .bind("mallocInit");
+        .bind("mallocInitVA");
 
 class PatternExporter : public clang::ast_matchers::MatchFinder::MatchCallback {
   public:
@@ -622,7 +625,26 @@ class PatternExporter : public clang::ast_matchers::MatchFinder::MatchCallback {
     virtual void
     run(const clang::ast_matchers::MatchFinder::MatchResult &Result) {
         if (const VarDecl *VD =
-                Result.Nodes.getNodeAs<clang::VarDecl>("mallocInit")) {
+                Result.Nodes.getNodeAs<clang::VarDecl>("mallocInitVA")) {
+            const Type *vd_type = VD->getType().getTypePtr();
+
+            if (!vd_type->isPointerType()) {
+                return;
+            }
+
+            QualType pointee_type = vd_type->getPointeeType();
+
+            const QualType *declared_type =
+                Result.Nodes.getNodeAs<clang::QualType>("declaredType");
+
+            if (declared_type->isNull()) {
+                std::cerr << "Could not get declared type";
+                return;
+            }
+
+            if (pointee_type != *declared_type) {
+                return;
+            }
 
             if (!analysis_results
                      ->emplace((void *)VD, AnalysisResult(HeapInfo(1)))
