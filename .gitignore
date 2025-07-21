@@ -56,3 +56,5 @@ inspect/
 *.rs.fixed
 analysis.txt
 polonius_cache/
+# c2rust test results
+c2rust-transpile/tests/*.rs

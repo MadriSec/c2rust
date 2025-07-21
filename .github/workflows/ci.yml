@@ -6,8 +6,14 @@ on:
   pull_request:
 
 jobs:
-  test-linux:
-    runs-on: ubuntu-latest
+  test:
+    strategy:
+      matrix:
+        os: [
+          ubuntu-latest, # x86_64
+          macos-13, # x86_64
+        ]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - run: rustup component add rustfmt rustc-dev
@@ -17,7 +23,10 @@ jobs:
       # cached, what gets used as part of the key, and what additional handling
       # happens to make the cache reliable and smaller.
       - uses: Swatinem/rust-cache@v2
-      - run: |
+
+      - name: Install packages (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
           sudo apt-get update
           sudo apt-get install \
             clang \
@@ -44,15 +53,24 @@ jobs:
             luarocks \
             ninja-build \
             pkg-config \
-            python3-pip \
-            python3-setuptools \
-            python3-wheel \
             rcs \
             strace \
             unzip \
             zlib1g-dev
-      - name: Provision Python Packages
-        run: python3 -m pip install -r $GITHUB_WORKSPACE/scripts/requirements.txt
+
+      - name: Install packages (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          # `bash` needed b/c macOS ships with bash 3, which doesn't support arrays properly
+          brew install -q cmake ninja gpg llvm@17 bash
+      
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Install Python Packages
+        run: |
+          uv venv
+          uv pip install -r ./scripts/requirements.txt
+
       - name: cargo fmt --check
         run: |
           export RUSTFLAGS="-D warnings"
@@ -78,4 +96,4 @@ jobs:
           # causing tons of errors, so don't set that.
           # `test_translator.py` does not rebuild,
           # so changing `RUSTFLAGS` will not trigger a full rebuild.
-          ./scripts/test_translator.py tests/
+          uv run ./scripts/test_translator.py tests/

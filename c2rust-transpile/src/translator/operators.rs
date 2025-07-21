@@ -233,6 +233,7 @@ impl<'c> Translation<'c> {
         }
     }
 
+    /// Translate an assignment binary operator
     fn convert_assignment_operator(
         &self,
         ctx: ExprContext,
@@ -262,7 +263,7 @@ impl<'c> Translation<'c> {
         )
     }
 
-    /// Translate an assignment binary operator
+    /// Translate an assignment binary operator, provided a pre-translated RHS expression
     fn convert_assignment_operator_with_rhs(
         &self,
         ctx: ExprContext,
@@ -505,7 +506,7 @@ impl<'c> Translation<'c> {
     ) -> TranslationResult<Box<Expr>> {
         let is_unsigned_integral_type = self
             .ast_context
-            .index(ctype)
+            .resolve_type(ctype)
             .kind
             .is_unsigned_integral_type();
 

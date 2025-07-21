@@ -101,6 +101,7 @@ pub enum ReplaceMode {
     Extern,
 }
 
+/// Options that impact an expression and all of its subexpressions.
 #[derive(Copy, Clone, Debug)]
 pub struct ExprContext {
     used: bool,
@@ -1712,8 +1713,8 @@ impl<'c> Translation<'c> {
                         .resolve_decl_suffix_name(decl_id, PADDING_SUFFIX)
                         .to_owned();
                     let padding_ty = mk().path_ty(vec!["usize"]);
-                    let outer_size = self.compute_size_of_ty(outer_ty)?.to_expr();
-                    let inner_size = self.compute_size_of_ty(inner_ty)?.to_expr();
+                    let outer_size = self.mk_size_of_ty_expr(outer_ty)?.to_expr();
+                    let inner_size = self.mk_size_of_ty_expr(inner_ty)?.to_expr();
                     let padding_value =
                         mk().binary_expr(BinOp::Sub(Default::default()), outer_size, inner_size);
                     let padding_const = mk()
@@ -2848,7 +2849,7 @@ impl<'c> Translation<'c> {
                             return true;
                         }
 
-                        // None assignments don't prove enough type information unless there are follow-up assignments
+                        // None assignments don't provide enough type information unless there are follow-up assignments
                         if let Some(CExprKind::ImplicitCast(_, _, CastKind::NullToPointer, _, _)) =
                             initializer_kind
                         {
@@ -3169,10 +3170,10 @@ impl<'c> Translation<'c> {
             });
         }
         let ty = self.convert_type(type_id)?;
-        self.compute_size_of_ty(ty)
+        self.mk_size_of_ty_expr(ty)
     }
 
-    fn compute_size_of_ty(&self, ty: Box<Type>) -> TranslationResult<WithStmts<Box<Expr>>> {
+    fn mk_size_of_ty_expr(&self, ty: Box<Type>) -> TranslationResult<WithStmts<Box<Expr>>> {
         let name = "size_of";
         let params = mk().angle_bracketed_args(vec![ty]);
         let path = vec![
@@ -3207,8 +3208,7 @@ impl<'c> Translation<'c> {
         Ok(WithStmts::new_val(call))
     }
 
-    // Fixing this would require major refactors for marginal benefit.
-    #[allow(clippy::vec_box)]
+    #[allow(clippy::vec_box/*, reason = "not worth a substantial refactor"*/)]
     fn convert_exprs(
         &self,
         ctx: ExprContext,
@@ -4480,6 +4480,8 @@ impl<'c> Translation<'c> {
             CastKind::VectorSplat => Err(TranslationError::generic(
                 "TODO vector splat casts not supported",
             )),
+
+            CastKind::AtomicToNonAtomic | CastKind::NonAtomicToAtomic => Ok(val),
         }
     }
 
@@ -4989,7 +4991,7 @@ impl<'c> Translation<'c> {
             Vector(..) => {
                 // Handled in `import_simd_typedef`
             }
-            TypeOfExpr(_) | BuiltinFn => {}
+            TypeOfExpr(_) | BuiltinFn | Atomic(..) => {}
             UnhandledSveType => {
                 // TODO: handle SVE types
             }

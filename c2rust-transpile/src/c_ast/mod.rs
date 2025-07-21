@@ -1229,6 +1229,8 @@ pub enum CastKind {
     BuiltinFnToFnPtr,
     ConstCast,
     VectorSplat,
+    AtomicToNonAtomic,
+    NonAtomicToAtomic,
 }
 
 /// Represents a unary operator in C (6.5.3 Unary operators) and GNU C extensions
@@ -1654,7 +1656,7 @@ pub enum CTypeKind {
     // Function type (6.7.5.3)
     //
     // Note a function taking no arguments should have one `void` argument. Functions without any
-    // arguments and in K&R format.
+    // arguments are in K&R format.
     // Flags: is_variable_argument, is_noreturn, has prototype
     Function(CQualTypeId, Vec<CQualTypeId>, bool, bool, bool),
 
@@ -1693,6 +1695,8 @@ pub enum CTypeKind {
     UnhandledSveType,
 
     Float128,
+    // Atomic types (6.7.2.4)
+    Atomic(CQualTypeId),
 }
 
 impl CTypeKind {

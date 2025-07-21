@@ -297,6 +297,8 @@ class TypeEncoder final : public TypeVisitor<TypeEncoder> {
 
     void VisitVariableArrayType(const VariableArrayType *T);
 
+    void VisitAtomicType(const AtomicType *AT);
+
     void VisitIncompleteArrayType(const IncompleteArrayType *T) {
         auto t = T->getElementType();
         auto qt = encodeQualType(t);
@@ -1353,7 +1355,13 @@ class TranslateASTVisitor final
                     // into); clang does this conversion, but rustc doesn't
                     convertedConstraint += '*';
                 }
+
+#if CLANG_VERSION_MAJOR < 21
                 convertedConstraint += SimplifyConstraint(constraint.str());
+#else
+                convertedConstraint += SimplifyConstraint(constraint);
+#endif
+
                 outputs.push_back(convertedConstraint);
                 output_infos.push_back(std::move(info));
             }
@@ -1368,7 +1376,11 @@ class TranslateASTVisitor final
                     // See above
                     convertedConstraint += '*';
                 }
+#if CLANG_VERSION_MAJOR < 21
                 convertedConstraint += SimplifyConstraint(constraint.str());
+#else
+                convertedConstraint += SimplifyConstraint(constraint);
+#endif
                 inputs.emplace_back(convertedConstraint);
             }
             for (unsigned i = 0, num = E->getNumClobbers(); i < num; ++i) {
@@ -2183,22 +2195,6 @@ class TranslateASTVisitor final
         // type
         auto T = def->getType();
 
-        // This seems like a really good way to add pointer location
-        // information, but is relly limited (3 bits of qualifiers, (const,
-        // volatile, restrict) clang exits if it sees more). We'd like to make
-        // the TypeEncoder get the info, but function signatures don't really
-        // allow that.
-
-        // T.addFastQualifiers(0xf); // This panics
-        // def->setType(T);
-
-        // def->dump();
-
-        if (isa<AtomicType>(T)) {
-            printC11AtomicError(def);
-            abort();
-        }
-
         auto loc = is_defn ? def->getLocation() : VD->getLocation();
 
         AnalysisResult analysis_result =
@@ -2288,10 +2284,6 @@ class TranslateASTVisitor final
         auto byteSize = 0;
 
         auto t = D->getTypeForDecl();
-        if (isa<AtomicType>(t)) {
-            printC11AtomicError(D);
-            abort();
-        }
 
         auto loc = D->getLocation();
         std::vector<void *> childIds;
@@ -2367,10 +2359,6 @@ class TranslateASTVisitor final
         // true;`.
 
         auto t = D->getTypeForDecl();
-        if (isa<AtomicType>(t)) {
-            printC11AtomicError(D);
-            abort();
-        }
 
         std::vector<void *> childIds;
         for (auto x : D->enumerators()) {
@@ -2434,10 +2422,6 @@ class TranslateASTVisitor final
 
         std::vector<void *> childIds;
         auto t = D->getType();
-        if (isa<AtomicType>(t)) {
-            printC11AtomicError(D);
-            abort();
-        }
 
         auto record = D->getParent();
         const ASTRecordLayout &layout =
@@ -2686,11 +2670,6 @@ class TranslateASTVisitor final
             CharSourceRange::getCharRange(E->getSourceRange()));
     }
 
-    void printC11AtomicError(Decl *D) {
-        std::string msg = "C11 Atomics are not supported. Aborting.";
-        printError(msg, D);
-    }
-
     void printError(std::string Message, Decl *D) {
         auto DiagBuilder =
             getDiagBuilder(D->getLocation(), DiagnosticsEngine::Error);
@@ -2777,15 +2756,16 @@ void TypeEncoder::VisitVariableArrayType(const VariableArrayType *T) {
 
     VisitQualType(t);
 }
-//
-// void TypeEncoder::VisitAtomicType(const AtomicType *AT) {
-//    std::string msg =
-//            "C11 Atomic types are not supported. Aborting.";
-////    auto horse = AT->get
-////    astEncoder->printError(msg, AT);
-//    AT->getValueType()->dump();
-//    abort();
-//}
+
+void TypeEncoder::VisitAtomicType(const AtomicType *AT) {
+    auto t = AT->getValueType();
+    auto qt = encodeQualType(t);
+
+    encodeType(AT, TagAtomicType,
+               [qt](CborEncoder *local) { cbor_encode_uint(local, qt); });
+
+    VisitQualType(t);
+}
 
 class TranslateConsumer : public clang::ASTConsumer {
     Outputs *outputs;
