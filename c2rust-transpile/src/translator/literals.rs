@@ -20,9 +20,9 @@ impl<'c> Translation<'c> {
             IntBase::Hex => mk().float_unsuffixed_lit(&format!("0x{:x}", val)),
             IntBase::Oct => mk().float_unsuffixed_lit(&format!("0o{:o}", val)),
         };
-
-        let target_ty = self.convert_type(ty.ctype)?;
-        Ok(mk().cast_expr(mk().lit_expr(lit), target_ty))
+        // This idea is too simple, the target_ty should depend on context.
+        // let target_ty = self.convert_type(ty.ctype)?;
+        Ok(mk().lit_expr(lit))
     }
 
     /// Given an integer value this attempts to either generate the corresponding enum

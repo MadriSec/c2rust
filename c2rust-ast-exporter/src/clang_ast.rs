@@ -234,7 +234,7 @@ pub fn process(items: Value) -> error::Result<AstContext> {
         let entry_id: u64 = from_value(entry.pop_front().unwrap()).unwrap();
         let tag = from_value(entry.pop_front().unwrap()).unwrap();
 
-        if !(tag < 400) {
+        if tag >= 400 {
             // If entry is a type
             let node = TypeNode {
                 tag: import_type_tag(tag),

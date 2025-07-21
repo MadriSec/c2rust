@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::mem;
 use std::ops::Index;
 use std::path::{self, PathBuf};
-use std::result::Result; // To override syn::Result from glob import
+use std::result::Result; // To override syn::Result &from glob import
 
 use dtoa;
 
@@ -17,6 +17,7 @@ use syn::spanned::Spanned as _;
 use syn::*;
 use syn::{BinOp, UnOp}; // To override c_ast::{BinOp,UnOp} from glob import
 
+use crate::analysis_result::HeapInfo;
 use crate::diagnostics::TranslationResult;
 use crate::rust_ast::comment_store::CommentStore;
 use crate::rust_ast::item_store::ItemStore;
@@ -27,12 +28,12 @@ use c2rust_ast_builder::{mk, properties::*, Builder};
 use c2rust_ast_printer::pprust::{self};
 
 use crate::c_ast::iterators::{DFExpr, SomeId};
-use crate::c_ast::*;
-use crate::cfg;
 use crate::convert_type::TypeConverter;
 use crate::renamer::Renamer;
 use crate::with_stmts::WithStmts;
-use crate::{c_ast, format_translation_err};
+use crate::{c_ast, format_translation_err, StdUse};
+use crate::{c_ast::*, StdUseDetails};
+use crate::{cfg, UseSet};
 use crate::{ExternCrate, ExternCrateDetails, TranspilerConfig};
 use c2rust_ast_exporter::clang_ast::LRValue;
 
@@ -248,6 +249,7 @@ pub struct Translation<'c> {
     pub features: RefCell<IndexSet<&'static str>>,
     sectioned_static_initializers: RefCell<Vec<Stmt>>,
     extern_crates: RefCell<CrateSet>,
+    std_uses: RefCell<UseSet>,
 
     // Translation state and utilities
     type_converter: RefCell<TypeConverter>,
@@ -504,8 +506,6 @@ pub fn translate(
         ternary_needs_parens: false,
         expanding_macro: None,
     };
-
-    t.use_crate(ExternCrate::Libc);
 
     // Sort the top-level declarations by file and source location so that we
     // preserve the ordering of all declarations in each file.
@@ -1032,6 +1032,10 @@ fn make_submodule(
 fn arrange_header(t: &Translation, is_binary: bool) -> (Vec<syn::Attribute>, Vec<Box<Item>>) {
     let mut out_attrs = vec![];
     let mut out_items = vec![];
+    for u in t.std_uses.borrow().iter() {
+        out_items
+            .push(mk().use_simple_item(mk().abs_path(StdUseDetails::from(*u).ident), None::<Ident>))
+    }
     if t.tcfg.emit_modules && !is_binary {
         for c in t.extern_crates.borrow().iter() {
             out_items.push(mk().use_simple_item(
@@ -1232,11 +1236,16 @@ impl<'c> Translation<'c> {
             main_file,
             extern_crates: RefCell::new(IndexSet::new()),
             cur_file: RefCell::new(None),
+            std_uses: RefCell::new(IndexSet::new()),
         }
     }
 
     fn use_crate(&self, extern_crate: ExternCrate) {
         self.extern_crates.borrow_mut().insert(extern_crate);
+    }
+
+    pub(crate) fn std_use(&self, std_use: StdUse) {
+        self.std_uses.borrow_mut().insert(std_use);
     }
 
     pub fn cur_file(&self) -> FileId {
@@ -2711,7 +2720,7 @@ impl<'c> Translation<'c> {
                 let mut stmts = self.compute_variable_array_sizes(ctx, typ.ctype)?;
 
                 let ConvertedVariable { ty, mutbl, init } = if heap_info.is_some() {
-                    self.convert_heap_variable(typ)?
+                    self.convert_heap_variable(ctx, &heap_info, typ)?
                 } else {
                     self.convert_variable(ctx, initializer, typ)?
                 };
@@ -2928,39 +2937,30 @@ impl<'c> Translation<'c> {
         Ok(ConvertedVariable { ty, mutbl, init })
     }
 
-    fn convert_heap_variable(&self, typ: CQualTypeId) -> TranslationResult<ConvertedVariable> {
+    fn convert_heap_variable(
+        &self,
+        ctx: ExprContext,
+        heap_info: &HeapInfo,
+        typ: CQualTypeId,
+    ) -> TranslationResult<ConvertedVariable> {
         let pointee_ctype = match self.ast_context.resolve_type(typ.ctype).kind {
             CTypeKind::Pointer(pt) => pt,
             _ => return Err("Heap variable is not a C pointer".into()),
         };
-
-        let init = {
-            match self.implicit_default_expr(pointee_ctype.ctype, true) {
-                Ok(default) => Ok(WithStmts::new_val(mk().call_expr(
-                    mk().path_expr(vec!["Box", "new"]),
-                    vec![default.into_value()],
-                ))),
-                Err(e) => Err(e),
-            }
-        };
-
         let pointee_ty = self.convert_type(pointee_ctype.ctype)?;
-        let ty =
-            mk().path_ty(vec![mk().path_segment_with_args(
-                "Box",
-                mk().angle_bracketed_args(vec![pointee_ty]),
-            )]);
-
+        let default = self
+            .implicit_default_expr(pointee_ctype.ctype, true)?
+            .into_value();
+        let (ty, init) = heap_info.generate_declaration(self, ctx, default, pointee_ty)?;
         let mutbl = if typ.qualifiers.is_const {
             Mutability::Immutable
         } else {
             Mutability::Mutable
         };
-
         Ok(ConvertedVariable { ty, mutbl, init })
     }
 
-    fn convert_type(&self, type_id: CTypeId) -> TranslationResult<Box<Type>> {
+    pub(crate) fn convert_type(&self, type_id: CTypeId) -> TranslationResult<Box<Type>> {
         if let Some(cur_file) = *self.cur_file.borrow() {
             self.import_type(type_id, cur_file);
         }
@@ -3502,7 +3502,7 @@ impl<'c> Translation<'c> {
                     val.prepend_stmts(stmts);
                     val
                 } else {
-                    self.convert_expr(ctx, expr)?
+                    return self.convert_expr(ctx, expr);
                 };
                 // Shuffle Vector "function" builtins will add a cast to the output of the
                 // builtin call which is unnecessary for translation purposes

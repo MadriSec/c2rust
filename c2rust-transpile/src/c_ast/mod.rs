@@ -33,6 +33,8 @@ pub type CTypedefId = CDeclId; // Typedef types need to point to 'DeclKind::Type
 pub type CEnumId = CDeclId; // Enum types need to point to 'DeclKind::Enum'
 pub type CEnumConstantId = CDeclId; // Enum's need to point to child 'DeclKind::EnumConstant's
 
+use crate::analysis_result::HeapInfo;
+
 pub use self::conversion::*;
 pub use self::print::Printer;
 
@@ -927,7 +929,7 @@ pub enum CDeclKind {
         initializer: Option<CExprId>,
         typ: CQualTypeId,
         attrs: IndexSet<Attribute>,
-        heap_info: Option<usize>,
+        heap_info: HeapInfo,
     },
 
     // Enum (http://clang.llvm.org/doxygen/classclang_1_1EnumDecl.html)

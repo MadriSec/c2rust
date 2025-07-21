@@ -2,6 +2,7 @@
 
 mod diagnostics;
 
+pub mod analysis_result;
 pub mod build_files;
 pub mod c_ast;
 pub mod cfg;
@@ -41,6 +42,7 @@ use std::prelude::v1::Vec;
 type PragmaVec = Vec<(&'static str, Vec<&'static str>)>;
 type PragmaSet = indexmap::IndexSet<(&'static str, &'static str)>;
 type CrateSet = indexmap::IndexSet<ExternCrate>;
+type UseSet = indexmap::IndexSet<StdUse>;
 type TranspileResult = Result<(PathBuf, PragmaVec, CrateSet), ()>;
 
 /// Configuration settings for the translation process
@@ -130,6 +132,30 @@ impl TranspilerConfig {
             .as_ref()
             .and_then(|x| x.file_name().map(|x| x.to_string_lossy().into_owned()))
             .unwrap_or_else(|| "c2rust_out".into())
+    }
+}
+
+#[derive(Copy, Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum StdUse {
+    TryFrom,
+}
+
+#[derive(Serialize)]
+struct StdUseDetails {
+    ident: Vec<&'static str>,
+}
+
+impl StdUseDetails {
+    fn new(ident: Vec<&'static str>) -> Self {
+        Self { ident }
+    }
+}
+
+impl From<StdUse> for StdUseDetails {
+    fn from(std_use: StdUse) -> Self {
+        match std_use {
+            StdUse::TryFrom => Self::new(vec!["std", "convert", "TryFrom"]),
+        }
     }
 }
 

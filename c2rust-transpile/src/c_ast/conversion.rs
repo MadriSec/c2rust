@@ -1934,13 +1934,30 @@ impl ConversionContext {
                     let attributes = from_value::<Vec<Value>>(node.extras[5].clone())
                         .expect("Expected attribute array on var decl");
                     // Add here the malloced initialized information, and more in the future
-                    let analysis_result =
-                        from_value::<Vec<Value>>(node.extras[6].clone()).expect("Should contain ");
+                    let analysis_result = from_value::<Vec<Value>>(node.extras[6].clone())
+                        .expect("Should contain analysis results");
 
-                    let heap_info: Option<usize> =
-                        match from_value::<usize>(analysis_result[0].clone()) {
-                            Ok(nb_elements) => Some(nb_elements),
-                            Err(_) => None,
+                    // None | 1 | Expr(ExprId, IsConstant)
+                    let heap_info: HeapInfo =
+                        match from_value::<Vec<Value>>(analysis_result[0].clone()) {
+                            Ok(length_enum) => {
+                                let nb_elements = from_value::<u64>(length_enum[0].clone())
+                                    .expect("HeapInfo whould contain length info in first element");
+                                if nb_elements == 1 {
+                                    HeapInfo::One
+                                } else {
+                                    let new_id = self.id_mapper.get_or_create_new(nb_elements);
+                                    let is_constant = from_value::<bool>(length_enum[1].clone())
+                                        .expect(
+                                            "Expression variants should contain constantness value",
+                                        );
+                                    HeapInfo::Expr {
+                                        expr_id: CExprId(new_id),
+                                        is_constant,
+                                    }
+                                }
+                            }
+                            Err(_) => HeapInfo::None,
                         };
 
                     assert!(
