@@ -26,9 +26,6 @@
 #include "clang/Frontend/FrontendActions.h"
 #include "clang/Tooling/CommonOptionsParser.h"
 
-#include "clang/ASTMatchers/ASTMatchFinder.h"
-#include "clang/ASTMatchers/ASTMatchers.h"
-
 #include "clang/AST/DeclVisitor.h"
 #include "clang/AST/RecordLayout.h"
 #include "clang/AST/RecursiveASTVisitor.h"
@@ -46,6 +43,7 @@
 #endif // CLANG_VERSION_MAJOR < 10
 #include "clang/Tooling/Tooling.h"
 
+#include "AstAnalyzer.hpp"
 #include "AstExporter.hpp"
 #include "ExportResult.hpp"
 #include "FloatingLexer.h"
@@ -55,7 +53,6 @@
 using namespace llvm;
 using namespace clang;
 using namespace clang::tooling;
-using namespace clang::ast_matchers;
 
 #define DEBUG_TYPE "c2rust-ast-exporter"
 
@@ -580,162 +577,6 @@ class TypeEncoder final : public TypeVisitor<TypeEncoder> {
     }
 };
 
-class HeapInfo {
-    size_t nb_elements;
-    bool is_constant;
-
-  public:
-    HeapInfo(size_t nb_elements, bool constantness)
-        : nb_elements(nb_elements), is_constant(constantness) {};
-    void encode(CborEncoder *encoder) {
-        CborEncoder local;
-        cbor_encoder_create_array(encoder, &local, CborIndefiniteLength);
-        cbor_encode_uint(&local, nb_elements);
-        if (nb_elements > 1) {
-            cbor_encode_boolean(&local, is_constant);
-        }
-        cbor_encoder_close_container(encoder, &local);
-    }
-};
-
-class AnalysisResult {
-    Optional<HeapInfo> heap_info;
-
-  public:
-    AnalysisResult() : heap_info({}) {};
-    AnalysisResult(HeapInfo hi) : heap_info(hi) {};
-    void encode(CborEncoder *encoder) {
-        CborEncoder local;
-        cbor_encoder_create_array(encoder, &local, CborIndefiniteLength);
-        if (heap_info.hasValue()) {
-            heap_info.getValue().encode(&local);
-        } else {
-            cbor_encode_null(&local);
-        }
-        cbor_encoder_close_container(encoder, &local);
-    }
-};
-
-DeclarationMatcher MallocMatcher =
-    varDecl(
-        hasInitializer(ignoringImpCasts( // Initialized variable declaration
-            callExpr(
-                callee(functionDecl(
-                    hasName("malloc"))), // That is a call to malloc
-                hasArgument(
-                    0,     // With its first argument being
-                    anyOf( // either
-                        sizeOfExpr(unaryExprOrTypeTraitExpr(hasArgumentOfType(
-                            qualType().bind("declaredType")))), // sizeof(t)
-                        binaryOperator( // or n * sizeof(t)
-                            hasOperatorName("*"),
-                            hasEitherOperand(ignoringParenImpCasts(sizeOfExpr(
-                                unaryExprOrTypeTraitExpr(
-                                    hasArgumentOfType(
-                                        qualType().bind("declaredType")))
-                                    .bind("avoid")))))
-                            .bind("binaryOperator")))))))
-        .bind("mallocInitVA");
-
-DeclarationMatcher CallocMatcher =
-    varDecl(hasInitializer(ignoringImpCasts( // Initialized variable declaration
-                callExpr(                    // that is a call
-                    callee(functionDecl(hasName("calloc"))), // to calloc
-                    hasArgument(0, expr().bind("nbElements")),
-                    hasArgument(
-                        1, // With its second argument being
-                        sizeOfExpr(unaryExprOrTypeTraitExpr(hasArgumentOfType(
-                            qualType().bind("declaredType")))) // sizeof(t)
-                        )))))
-        .bind("callocInitVA");
-
-class PatternExporter : public MatchFinder::MatchCallback {
-    // This stores analysis information gathered from matchers, but also
-    // ultimately from static analysis
-    std::unordered_map<void *, AnalysisResult> *analysis_results;
-
-    ASTContext *Context;
-
-  public:
-    explicit PatternExporter(
-        std::unordered_map<void *, AnalysisResult> *results,
-        ASTContext *context)
-        : analysis_results(results), Context(context) {};
-
-    bool coherent_types(const MatchFinder::MatchResult &Result,
-                        const VarDecl *VD) {
-        const Type *vd_type = VD->getType().getTypePtr();
-        if (!vd_type->isPointerType()) {
-            return false;
-        }
-        QualType pointee_type = vd_type->getPointeeType();
-        const QualType *declared_type =
-            Result.Nodes.getNodeAs<clang::QualType>("declaredType");
-        if (declared_type->isNull()) {
-            std::cerr << "Could not get declared type";
-            return false;
-        }
-        return pointee_type == *declared_type;
-    };
-
-    virtual void run(const MatchFinder::MatchResult &Result) {
-        if (const VarDecl *VD =
-                Result.Nodes.getNodeAs<clang::VarDecl>("mallocInitVA")) {
-            if (!coherent_types(Result, VD)) {
-                return;
-            }
-
-            size_t nb_elements = 1;
-            bool is_constant = false;
-            if (const BinaryOperator *ElemCount =
-                    Result.Nodes.getNodeAs<clang::BinaryOperator>(
-                        "binaryOperator")) {
-                Expr *nb_elem_expr = ElemCount->getLHS()->IgnoreImpCasts();
-                if (nb_elem_expr ==
-                    Result.Nodes.getNodeAs<clang::Expr>("avoid")) {
-                    nb_elem_expr = ElemCount->getRHS()->IgnoreImpCasts();
-                }
-                is_constant =
-                    nb_elem_expr->isConstantInitializer(*Context, false, NULL);
-                nb_elements = (size_t)nb_elem_expr;
-            }
-
-            // std::cout << "Libtooling side : Is constant : " << is_constant
-            //           << std::endl;
-            if (!analysis_results
-                     ->emplace((void *)VD, AnalysisResult(HeapInfo(
-                                               nb_elements, is_constant)))
-                     .second) {
-                std::cerr << "Variable was not successfully inserted :/\n";
-            };
-        } else if (const VarDecl *VD =
-                       Result.Nodes.getNodeAs<clang::VarDecl>("callocInitVA")) {
-            if (!coherent_types(Result, VD)) {
-                return;
-            }
-            size_t nb_elements = 0;
-            const Expr *nb_elem_expr =
-                Result.Nodes.getNodeAs<Expr>("nbElements");
-            bool is_constant =
-                nb_elem_expr->isConstantInitializer(*Context, false, NULL);
-            if (is_constant) {
-                Expr::EvalResult result;
-                nb_elem_expr->EvaluateAsInt(result, *Context);
-                nb_elements = result.Val.getInt().getExtValue();
-            }
-            if (nb_elements != 1) {
-                nb_elements = (size_t)nb_elem_expr;
-            }
-            if (!analysis_results
-                     ->emplace((void *)VD, AnalysisResult(HeapInfo(
-                                               nb_elements, is_constant)))
-                     .second) {
-                std::cerr << "Variable was not successfully inserted :/\n";
-            };
-        }
-    }
-};
-
 class TranslateASTVisitor final
     : public RecursiveASTVisitor<TranslateASTVisitor> {
 
@@ -1009,12 +850,13 @@ class TranslateASTVisitor final
                                  Preprocessor &PP)
         : Context(Context), typeEncoder(Context, encoder, sugared, this),
           encoder(encoder), PP(PP), files{{"", {}}} {
-        PatternExporter pattern_exporter =
-            PatternExporter(&this->analysis_results, this->Context);
-        MatchFinder Finder;
-        Finder.addMatcher(MallocMatcher, &pattern_exporter);
-        Finder.addMatcher(CallocMatcher, &pattern_exporter);
-        Finder.matchAST(*Context);
+        // HeapAllocationAnalyzer pattern_exporter =
+        //     HeapAllocationAnalyzer(&this->analysis_results, this->Context);
+        // MatchFinder Finder;
+        // Finder.addMatcher(MallocMatcher, &pattern_exporter);
+        // Finder.addMatcher(CallocMatcher, &pattern_exporter);
+        // Finder.matchAST(*Context);
+        analyse_context(&this->analysis_results, this->Context);
     }
 
     /// Get the analysis results of a node if present.
@@ -1936,7 +1778,16 @@ class TranslateASTVisitor final
         for (auto x : CE->arguments()) {
             childIds.push_back(x);
         }
-        encode_entry(CE, TagCallExpr, childIds);
+
+        // get the analysis result and encode it.
+        AnalysisResult analysis_result =
+            get_analysis_results((void *)CE).getValueOr(AnalysisResult());
+
+        encode_entry(CE, TagCallExpr, childIds,
+                     [&analysis_result](CborEncoder *array) {
+                         analysis_result.encode(array);
+                     });
+
         return true;
     }
 

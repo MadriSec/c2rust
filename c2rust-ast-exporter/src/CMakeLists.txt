@@ -45,6 +45,7 @@ set_target_properties(tinycbor PROPERTIES IMPORTED_LOCATION ${CMAKE_BINARY_DIR}/
 add_dependencies(tinycbor tinycbor_build)
 
 set(AST_EXPORTER_SRCS
+  AstAnalyzer.cpp
   AstExporter.cpp
   FloatingLexer.cpp
   ExportResult.cpp
