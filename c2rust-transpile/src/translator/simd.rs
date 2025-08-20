@@ -546,7 +546,7 @@ impl<'c> Translation<'c> {
 
         match self.ast_context[expr_id].kind {
             CExprKind::ShuffleVector(..) => is_explicit && kind == CastKind::BitCast,
-            CExprKind::Call(_, fn_id, _) => {
+            CExprKind::Call(_, fn_id, _, _) => {
                 let fn_expr = &self.ast_context[fn_id].kind;
 
                 if let CExprKind::ImplicitCast(_, expr_id, BuiltinFnToFnPtr, _, _) = fn_expr {

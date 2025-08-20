@@ -1356,6 +1356,7 @@ impl CfgBuilder {
         })
     }
 
+    // Crazy that some of the translation occurs here.
     /// Translate a C statement, inserting it into the CFG under the label key passed in.
     ///
     /// If the input C statement naturally passes control to the statement that follows it, the

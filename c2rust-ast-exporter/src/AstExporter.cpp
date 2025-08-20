@@ -598,7 +598,7 @@ class TranslateASTVisitor final
 
     // This stores analysis information gathered from matchers, but also
     // ultimately from static analysis
-    std::unordered_map<void *, AnalysisResult> analysis_results;
+    AnalysisResults analysis_results;
 
     // This stores a raw encoding of the macro call site SourceLocation, since
     // SourceLocation isn't hashable.
@@ -850,24 +850,9 @@ class TranslateASTVisitor final
                                  Preprocessor &PP)
         : Context(Context), typeEncoder(Context, encoder, sugared, this),
           encoder(encoder), PP(PP), files{{"", {}}} {
-        // HeapAllocationAnalyzer pattern_exporter =
-        //     HeapAllocationAnalyzer(&this->analysis_results, this->Context);
-        // MatchFinder Finder;
-        // Finder.addMatcher(MallocMatcher, &pattern_exporter);
-        // Finder.addMatcher(CallocMatcher, &pattern_exporter);
-        // Finder.matchAST(*Context);
         analyse_context(&this->analysis_results, this->Context);
     }
 
-    /// Get the analysis results of a node if present.
-    Optional<AnalysisResult> get_analysis_results(void *ast_node) {
-        auto res = analysis_results.find(ast_node);
-        if (res != analysis_results.end()) {
-            return res->second;
-        } else {
-            return {};
-        }
-    }
     // Override the default behavior of the RecursiveASTVisitor
     bool shouldVisitImplicitCode() const { return true; }
 
@@ -1781,7 +1766,8 @@ class TranslateASTVisitor final
 
         // get the analysis result and encode it.
         AnalysisResult analysis_result =
-            get_analysis_results((void *)CE).getValueOr(AnalysisResult());
+            analysis_results.get_analysis_result((uintptr_t)CE)
+                .getValueOr(AnalysisResult());
 
         encode_entry(CE, TagCallExpr, childIds,
                      [&analysis_result](CborEncoder *array) {
@@ -1919,9 +1905,15 @@ class TranslateASTVisitor final
 
         auto functionType = FD->getType();
         auto span = paramsFD->getSourceRange();
+        AnalysisResult analysis_result =
+            analysis_results.get_analysis_result((uintptr_t)FD)
+                .getValueOr(AnalysisResult());
+        if (analysis_result.get_pointer_info().hasValue()) {
+            // FD->dump();
+        }
         encode_entry(
             FD, TagFunctionDecl, span, childIds, functionType,
-            [this, FD](CborEncoder *array) {
+            [this, FD, &analysis_result](CborEncoder *array) {
                 auto name = FD->getNameAsString();
                 cbor_encode_string(array, name);
 
@@ -1978,8 +1970,9 @@ class TranslateASTVisitor final
                         }
                     }
                 }
-
                 cbor_encoder_close_container(array, &attr_info);
+
+                analysis_result.encode(array);
             });
         typeEncoder.VisitQualType(functionType);
 
@@ -2048,8 +2041,12 @@ class TranslateASTVisitor final
 
         auto loc = is_defn ? def->getLocation() : VD->getLocation();
 
-        AnalysisResult analysis_result =
-            get_analysis_results((void *)VD).getValueOr(AnalysisResult());
+        AnalysisResult analysis_result = AnalysisResult();
+        if (initializer != NULL) {
+            analysis_result =
+                analysis_results.get_analysis_result((uintptr_t)VD)
+                    .getValueOr(AnalysisResult());
+        }
 
         encode_entry(
             VD, TagVarDecl, loc, childIds, T,

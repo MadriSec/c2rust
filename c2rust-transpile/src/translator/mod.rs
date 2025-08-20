@@ -17,7 +17,7 @@ use syn::spanned::Spanned as _;
 use syn::*;
 use syn::{BinOp, UnOp}; // To override c_ast::{BinOp,UnOp} from glob import
 
-use crate::analysis_result::HeapInfo;
+use crate::analysis_result::PointerInfo;
 use crate::diagnostics::TranslationResult;
 use crate::rust_ast::comment_store::CommentStore;
 use crate::rust_ast::item_store::ItemStore;
@@ -1859,6 +1859,7 @@ impl<'c> Translation<'c> {
                 ref parameters,
                 body,
                 ref attrs,
+                return_pointer_info,
                 ..
             } => {
                 let new_name = &self
@@ -1871,6 +1872,7 @@ impl<'c> Translation<'c> {
                     return Ok(ConvertedDecl::NoItem);
                 }
 
+                // Ret should be determined differently here
                 let (ret, is_variadic): (Option<CQualTypeId>, bool) =
                     match self.ast_context.resolve_type(typ).kind {
                         CTypeKind::Function(ret, _, is_var, is_noreturn, _) => {
@@ -1886,6 +1888,7 @@ impl<'c> Translation<'c> {
                         }
                     };
 
+                // this is where arguments are collected before translation
                 let mut args: Vec<(CDeclId, String, CQualTypeId)> = vec![];
                 for param_id in parameters {
                     if let CDeclKind::Variable { ref ident, typ, .. } =
@@ -1915,6 +1918,7 @@ impl<'c> Translation<'c> {
                     ret,
                     body,
                     attrs,
+                    return_pointer_info,
                 );
 
                 converted_function.or_else(|e| match self.tcfg.replace_unsupported_decls {
@@ -1932,6 +1936,7 @@ impl<'c> Translation<'c> {
                         ret,
                         None,
                         attrs,
+                        return_pointer_info,
                     ),
                     _ => Err(e),
                 })
@@ -2246,6 +2251,7 @@ impl<'c> Translation<'c> {
         return_type: Option<CQualTypeId>,
         body: Option<CStmtId>,
         attrs: &IndexSet<c_ast::Attribute>,
+        return_pointer_info: Option<PointerInfo>,
     ) -> TranslationResult<ConvertedDecl> {
         self.function_context.borrow_mut().enter_new(name);
 
@@ -2254,8 +2260,20 @@ impl<'c> Translation<'c> {
 
             // handle regular (non-variadic) arguments
             for &(decl_id, ref var, typ) in arguments {
-                let ConvertedVariable { ty, mutbl, init: _ } =
-                    self.convert_variable(ctx, None, typ)?;
+                // This is where we should translate pointers differently
+                let ConvertedVariable {
+                    mut ty,
+                    mutbl,
+                    init: _,
+                } = self.convert_variable(ctx, None, typ)?;
+                if body.is_some() {
+                    match *ty {
+                        Type::Ptr(TypePtr { elem, .. }) => {
+                            ty = mk().mutbl().ref_ty(mk().slice_ty(elem))
+                        }
+                        _ => (),
+                    }
+                }
 
                 let pat = if var.is_empty() {
                     mk().wild_pat()
@@ -2300,10 +2318,11 @@ impl<'c> Translation<'c> {
                 }
             }
 
-            // handle return type
-            let ret = match return_type {
-                Some(return_type) => self.convert_type(return_type.ctype)?,
-                None => mk().never_ty(),
+            // handle return type. This should change
+            let ret = match (return_pointer_info, return_type) {
+                (Some(pointer_info), _) => pointer_info.generate_type(self, ctx)?,
+                (None, Some(return_type)) => self.convert_type(return_type.ctype)?,
+                (None, None) => mk().never_ty(),
             };
             let is_void_ret = return_type
                 .map(|qty| self.ast_context[qty.ctype].kind == CTypeKind::Void)
@@ -2682,7 +2701,7 @@ impl<'c> Translation<'c> {
                 ref ident,
                 initializer,
                 typ,
-                heap_info,
+                pointer_info,
                 ..
             } => {
                 assert!(
@@ -2719,11 +2738,9 @@ impl<'c> Translation<'c> {
                 };
 
                 let mut stmts = self.compute_variable_array_sizes(ctx, typ.ctype)?;
-
-                let ConvertedVariable { ty, mutbl, init } = if heap_info.is_some() {
-                    self.convert_heap_variable(ctx, &heap_info, typ)?
-                } else {
-                    self.convert_variable(ctx, initializer, typ)?
+                let ConvertedVariable { ty, mutbl, init } = match pointer_info {
+                    Some(pi) => self.convert_analyzed_variable(ctx, initializer, &pi, typ)?,
+                    None => self.convert_variable(ctx, initializer, typ)?,
                 };
                 let mut init = init?;
 
@@ -2835,7 +2852,7 @@ impl<'c> Translation<'c> {
 
         // If the RHS is a func call, we should be able to skip type annotation
         // because we get a type from the function return type
-        if let Some(CExprKind::Call(_, _, _)) = initializer_kind {
+        if let Some(CExprKind::Call(_, _, _, _)) = initializer_kind {
             return false;
         }
 
@@ -2911,10 +2928,9 @@ impl<'c> Translation<'c> {
         typ: CQualTypeId,
     ) -> TranslationResult<ConvertedVariable> {
         let init = match initializer {
-            Some(x) => self.convert_expr(ctx.used(), x),
+            Some(x) => self.convert_expr(ctx.used(), x), // Something weird happens here
             None => self.implicit_default_expr(typ.ctype, ctx.is_static),
         };
-
         // Variable declarations for variable-length arrays use the type of a pointer to the
         // underlying array element
         let ty = if let CTypeKind::VariableArray(mut elt, _) =
@@ -2938,21 +2954,24 @@ impl<'c> Translation<'c> {
         Ok(ConvertedVariable { ty, mutbl, init })
     }
 
-    fn convert_heap_variable(
+    fn convert_analyzed_variable(
         &self,
         ctx: ExprContext,
-        heap_info: &HeapInfo,
+        initializer: Option<CExprId>,
+        pointer_info: &PointerInfo,
         typ: CQualTypeId,
     ) -> TranslationResult<ConvertedVariable> {
-        let pointee_ctype = match self.ast_context.resolve_type(typ.ctype).kind {
-            CTypeKind::Pointer(pt) => pt,
-            _ => return Err("Heap variable is not a C pointer".into()),
+        let ty = pointer_info.generate_type(self, ctx)?;
+
+        let init = if pointer_info.is_alloc() {
+            pointer_info.generate_alloc(self, ctx)
+        } else {
+            match initializer {
+                Some(x) => self.convert_expr(ctx.used(), x),
+                None => self.implicit_default_expr(typ.ctype, ctx.is_static),
+            }
         };
-        let pointee_ty = self.convert_type(pointee_ctype.ctype)?;
-        let default = self
-            .implicit_default_expr(pointee_ctype.ctype, true)?
-            .into_value();
-        let (ty, init) = heap_info.generate_declaration(self, ctx, default, pointee_ty)?;
+
         let mutbl = if typ.qualifiers.is_const {
             Mutability::Immutable
         } else {
@@ -3713,31 +3732,44 @@ impl<'c> Translation<'c> {
                             // stmts.extend(lhs.stmts_mut());
                             // is_unsafe = is_unsafe || lhs.is_unsafe();
 
-                            let lhs_type_id = lhs_node
-                                .get_type()
-                                .ok_or_else(|| format_err!("bad lhs type"))?;
+                            // let lhs_type_id = lhs_node
+                            //     .get_type()
+                            //     .ok_or_else(|| format_err!("bad lhs type"))?;
 
-                            // Determine the type of element being indexed
-                            let pointee_type_id =
-                                match self.ast_context.resolve_type(lhs_type_id).kind {
-                                    CTypeKind::Pointer(pointee_id) => pointee_id,
-                                    _ => {
-                                        return Err(format_err!(
-                                            "Subscript applied to non-pointer: {:?}",
-                                            lhs
-                                        )
-                                        .into());
-                                    }
-                                };
+                            // // Determine the type of element being indexed
+                            // let pointee_type_id =
+                            //     match self.ast_context.resolve_type(lhs_type_id).kind {
+                            //         CTypeKind::Pointer(pointee_id) => pointee_id,
+                            //         _ => {
+                            //             return Err(format_err!(
+                            //                 "Subscript applied to non-pointer: {:?}",
+                            //                 lhs
+                            //             )
+                            //             .into());
+                            //         }
+                            //     };
 
-                            let mul = self.compute_size_of_expr(pointee_type_id.ctype);
-                            Ok(pointer_offset(lhs, rhs, mul, false, true))
+                            // let mul = self.compute_size_of_expr(pointee_type_id.ctype);
+                            // Ok(pointer_offset(lhs, rhs, mul, false, true))
+
+                            Ok(mk().index_expr(lhs, cast_int(rhs, "usize", false)))
                         })
                     }
                 })
             }
 
-            Call(call_expr_ty, func, ref args) => {
+            Call(call_expr_ty, func, ref args, pointer_info) => {
+                if let Some(hi) = pointer_info {
+                    if hi.is_alloc() {
+                        let call = hi.generate_alloc(self, ctx)?;
+                        return self.convert_side_effects_expr(
+                            ctx,
+                            call,
+                            "Function call expression is not supposed to be used",
+                        );
+                    }
+                }
+
                 let fn_ty =
                     self.ast_context
                         .get_pointee_qual_type(
@@ -3749,10 +3781,13 @@ impl<'c> Translation<'c> {
 
                 let mut is_external = false;
 
-                let is_variadic = match fn_ty {
-                    Some(CTypeKind::Function(_, _, is_variadic, _, _)) => *is_variadic,
-                    _ => false,
+                let (c_parameters, is_variadic) = match fn_ty {
+                    Some(CTypeKind::Function(_, args, is_variadic, _, _)) => {
+                        (args.clone(), *is_variadic)
+                    }
+                    _ => (Vec::new(), false),
                 };
+
                 let func = match self.ast_context[func].kind {
                     // Direct function call
                     CExprKind::ImplicitCast(_, fexp, CastKind::FunctionToPointerDecay, _, _)
@@ -3764,7 +3799,7 @@ impl<'c> Translation<'c> {
                                 CExprKind::DeclRef(_, decl, _) => &self.ast_context[decl],
                                 _ => unreachable!()
                             };
-                            is_external = match decl.kind {
+                            is_external= match decl.kind {
                                 CDeclKind::Function { is_extern,.. } => is_extern,
                                 _ => unreachable!()
                             };
@@ -3826,24 +3861,51 @@ impl<'c> Translation<'c> {
                     }
                 };
 
-                let mut call = func.and_then(|func| {
-                    // We want to decay refs only when function is variadic
-                    ctx.decay_ref = DecayRef::from(is_variadic);
+                let call = if !is_external {
+                    func.and_then(|func| {
+                        // We want to decay refs only when function is variadic
+                        ctx.decay_ref = DecayRef::from(is_variadic);
 
-                    let args = self.convert_exprs(ctx.used(), args)?;
+                        let mut should_borrow = Vec::new();
+                        for c_param in c_parameters {
+                            let ty = &self.ast_context[c_param.ctype].kind;
+                            should_borrow.push(matches!(ty, CTypeKind::Pointer(..)))
+                        }
 
-                    let res: TranslationResult<_> = Ok(args.map(|args| mk().call_expr(func, args)));
-                    res
-                })?;
+                        // here, &mut should be added to pointer types to less the original Type expressivity
+                        let mut args = self.convert_exprs(ctx.used(), args)?.into_value();
+                        args = args
+                            .iter()
+                            .zip(should_borrow.iter())
+                            .map(|(arg, should_borrow)| {
+                                if *should_borrow {
+                                    mk().mutbl().addr_of_expr(arg.clone()) // Couldn't find a way to avoid using clone
+                                } else {
+                                    arg.clone()
+                                }
+                            })
+                            .collect();
+                        let args = WithStmts::new(vec![], args);
+                        let res: TranslationResult<_> =
+                            Ok(args.map(|args| mk().call_expr(func, args)));
+                        res
+                    })?
+                } else {
+                    func.and_then(|func| {
+                        // We want to decay refs only when function is variadic
+                        ctx.decay_ref = DecayRef::from(is_variadic);
 
-                if is_external {
-                    call = WithStmts::new(
-                        vec![],
-                        mk().unsafe_block_expr(
-                            mk().unsafe_block(vec![mk().expr_stmt(call.into_value())]),
-                        ),
-                    );
-                }
+                        // here, &mut should be added to pointer types to less the original Type expressivity
+                        let args = self.convert_exprs(ctx.used(), args)?;
+
+                        let res: TranslationResult<_> = Ok(args.map(|args| {
+                            mk().unsafe_block_expr(
+                                mk().unsafe_block(vec![mk().expr_stmt(mk().call_expr(func, args))]),
+                            )
+                        }));
+                        res
+                    })?
+                };
 
                 self.convert_side_effects_expr(
                     ctx,

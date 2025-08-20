@@ -33,7 +33,7 @@ pub type CTypedefId = CDeclId; // Typedef types need to point to 'DeclKind::Type
 pub type CEnumId = CDeclId; // Enum types need to point to 'DeclKind::Enum'
 pub type CEnumConstantId = CDeclId; // Enum's need to point to child 'DeclKind::EnumConstant's
 
-use crate::analysis_result::HeapInfo;
+use crate::analysis_result::PointerInfo;
 
 pub use self::conversion::*;
 pub use self::print::Printer;
@@ -538,7 +538,7 @@ impl TypedAstContext {
     /// that it doesn't, return `false`.
     pub fn expr_diverges(&self, expr_id: CExprId) -> bool {
         let func_id = match self.index(expr_id).kind {
-            CExprKind::Call(_, func_id, _) => func_id,
+            CExprKind::Call(_, func_id, _, _) => func_id,
             _ => return false,
         };
 
@@ -917,6 +917,7 @@ pub enum CDeclKind {
         parameters: Vec<CParamId>,
         body: Option<CStmtId>,
         attrs: IndexSet<Attribute>,
+        return_pointer_info: Option<PointerInfo>,
     },
 
     // http://clang.llvm.org/doxygen/classclang_1_1VarDecl.html
@@ -929,7 +930,7 @@ pub enum CDeclKind {
         initializer: Option<CExprId>,
         typ: CQualTypeId,
         attrs: IndexSet<Attribute>,
-        heap_info: HeapInfo,
+        pointer_info: Option<PointerInfo>,
     },
 
     // Enum (http://clang.llvm.org/doxygen/classclang_1_1EnumDecl.html)
@@ -1072,7 +1073,7 @@ pub enum CExprKind {
     DeclRef(CQualTypeId, CDeclId, LRValue),
 
     // Function call
-    Call(CQualTypeId, CExprId, Vec<CExprId>),
+    Call(CQualTypeId, CExprId, Vec<CExprId>, Option<PointerInfo>),
 
     // Member access
     Member(CQualTypeId, CExprId, CDeclId, MemberKind, LRValue),
@@ -1163,7 +1164,7 @@ impl CExprKind {
             | CExprKind::ImplicitCast(ty, _, _, _, _)
             | CExprKind::ExplicitCast(ty, _, _, _, _)
             | CExprKind::DeclRef(ty, _, _)
-            | CExprKind::Call(ty, _, _)
+            | CExprKind::Call(ty, _, _, _)
             | CExprKind::Member(ty, _, _, _, _)
             | CExprKind::ArraySubscript(ty, _, _, _)
             | CExprKind::Conditional(ty, _, _, _)

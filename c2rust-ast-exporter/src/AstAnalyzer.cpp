@@ -1,12 +1,13 @@
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
 #include <llvm-14/llvm/ADT/Optional.h>
 #include <ostream>
+#include <sys/types.h>
 #include <unordered_map>
-#include <utility>
 
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/Decl.h"
@@ -34,88 +35,99 @@ using namespace llvm;
 using namespace clang;
 using namespace clang::ast_matchers;
 
-void HeapInfo::encode(CborEncoder *encoder) {
+void PointerInfo::encode(CborEncoder *encoder) {
     CborEncoder local;
     cbor_encoder_create_array(encoder, &local, CborIndefiniteLength);
+    cbor_encode_boolean(&local, is_alloc);
+    cbor_encode_boolean(&local, is_heap);
+    cbor_encode_uint(&local, (uintptr_t)declared_type);
     cbor_encode_uint(&local, nb_elements);
     if (nb_elements > 1) {
         cbor_encode_boolean(&local, is_constant);
     }
     cbor_encoder_close_container(encoder, &local);
 }
+const Type *PointerInfo::get_type() { return this->declared_type; }
+void PointerInfo::unset_is_alloc() { this->is_alloc = false; }
 
 void AnalysisResult::encode(CborEncoder *encoder) {
     CborEncoder local;
     cbor_encoder_create_array(encoder, &local, CborIndefiniteLength);
-    if (heap_info.hasValue()) {
-        heap_info.getValue().encode(&local);
+    if (pointer_info.hasValue()) {
+        pointer_info.getValue().encode(&local);
     } else {
         cbor_encode_null(&local);
     }
     cbor_encoder_close_container(encoder, &local);
 }
+Optional<PointerInfo> AnalysisResult::get_pointer_info() {
+    return this->pointer_info;
+}
+void AnalysisResult::unset_ptr_is_alloc() {
 
-DeclarationMatcher MallocMatcher =
-    varDecl(
-        hasInitializer(ignoringImpCasts( // Initialized variable declaration
-            callExpr(
-                callee(functionDecl(
-                    hasName("malloc"))), // That is a call to malloc
-                hasArgument(
-                    0,     // With its first argument being
-                    anyOf( // either
-                        sizeOfExpr(unaryExprOrTypeTraitExpr(hasArgumentOfType(
-                            qualType().bind("declaredType")))), // sizeof(t)
-                        binaryOperator( // or n * sizeof(t)
-                            hasOperatorName("*"),
-                            hasEitherOperand(ignoringParenImpCasts(sizeOfExpr(
-                                unaryExprOrTypeTraitExpr(
-                                    hasArgumentOfType(
-                                        qualType().bind("declaredType")))
-                                    .bind("avoid")))))
-                            .bind("binaryOperator")))))))
-        .bind("mallocInitVA");
+    if (pointer_info.hasValue()) {
 
-DeclarationMatcher CallocMatcher =
-    varDecl(hasInitializer(ignoringImpCasts( // Initialized variable declaration
-                callExpr(                    // that is a call
-                    callee(functionDecl(hasName("calloc"))), // to calloc
-                    hasArgument(0, expr().bind("nbElements")),
-                    hasArgument(
-                        1, // With its second argument being
-                        sizeOfExpr(unaryExprOrTypeTraitExpr(hasArgumentOfType(
-                            qualType().bind("declaredType")))) // sizeof(t)
-                        ))
-                    .bind("init"))))
-        .bind("callocInitVA");
+        PointerInfo pi = pointer_info.getValue();
+        pi.unset_is_alloc();
+        this->pointer_info = pi;
+        pi.get_is_alloc();
+    }
+}
+
+bool AnalysisResults::add_result(uintptr_t node,
+                                 AnalysisResult analysis_result) {
+
+    analysis_result.get_pointer_info().hasValue();
+    // this should change when implementing analysis result merging
+    changed |= map.emplace(node, analysis_result).second;
+    return changed;
+}
+Optional<AnalysisResult>
+AnalysisResults::get_analysis_result(uintptr_t ast_node) {
+    auto res = map.find(ast_node);
+    if (res != map.end()) {
+        return res->second;
+    } else {
+        return {};
+    }
+}
+void AnalysisResults::erase(uintptr_t node) { map.erase(node); }
+
+auto MallocExpr =
+    callExpr(
+        callee(functionDecl(hasName("malloc"))), // That is a call to malloc
+        hasArgument(
+            0,     // With its first argument being
+            anyOf( // either
+                sizeOfExpr(unaryExprOrTypeTraitExpr(hasArgumentOfType(
+                    qualType().bind("declaredType")))), // sizeof(t)
+                binaryOperator(                         // or n * sizeof(t)
+                    hasOperatorName("*"),
+                    hasEitherOperand(ignoringParenImpCasts(sizeOfExpr(
+                        unaryExprOrTypeTraitExpr(
+                            hasArgumentOfType(qualType().bind("declaredType")))
+                            .bind("avoid")))))
+                    .bind("binaryOperator"))))
+        .bind("mallocCall");
+auto CallocExpr =
+    callExpr(                                    // that is a call
+        callee(functionDecl(hasName("calloc"))), // to calloc
+        hasArgument(0, expr().bind("nbElements")),
+        hasArgument(1, // With its second argument being
+                    sizeOfExpr(unaryExprOrTypeTraitExpr(hasArgumentOfType(
+                        qualType().bind("declaredType")))) // sizeof(t)
+                    ))
+        .bind("callocCall");
 
 class HeapAllocationAnalyzer : public MatchFinder::MatchCallback {
     // This stores analysis information gathered from matchers, but also
     // ultimately from static analysis
-    std::unordered_map<void *, AnalysisResult> *analysis_results;
+    AnalysisResults *analysis_results;
 
     ASTContext *Context;
-    bool coherent_types(const MatchFinder::MatchResult &result,
-                        const VarDecl *var_decl) {
-        const Type *vd_type = var_decl->getType().getTypePtr();
-        if (!vd_type->isPointerType()) {
-            return false;
-        }
-        QualType pointee_type = vd_type->getPointeeType();
-        const QualType *declared_type =
-            result.Nodes.getNodeAs<clang::QualType>("declaredType");
-        if (declared_type->isNull()) {
-            std::cerr << "Could not get declared type";
-            return false;
-        }
-        return pointee_type == *declared_type;
-    };
-    bool handle_malloc(const VarDecl *var_decl,
-                       const MatchFinder::MatchResult result,
+
+    bool handle_malloc(const MatchFinder::MatchResult result,
                        size_t *nb_elements, bool *is_constant) {
-        if (!coherent_types(result, var_decl)) {
-            return false;
-        }
         const BinaryOperator *elem_count =
             result.Nodes.getNodeAs<clang::BinaryOperator>("binaryOperator");
 
@@ -133,13 +145,8 @@ class HeapAllocationAnalyzer : public MatchFinder::MatchCallback {
 
         return true;
     }
-
-    bool handle_calloc(const VarDecl *var_decl,
-                       const MatchFinder::MatchResult result,
+    bool handle_calloc(const MatchFinder::MatchResult result,
                        size_t *nb_elements, bool *is_constant) {
-        if (!coherent_types(result, var_decl)) {
-            return false;
-        }
         *nb_elements = 0;
         const Expr *nb_elem_expr = result.Nodes.getNodeAs<Expr>("nbElements");
         *is_constant =
@@ -156,9 +163,8 @@ class HeapAllocationAnalyzer : public MatchFinder::MatchCallback {
     }
 
   public:
-    explicit HeapAllocationAnalyzer(
-        std::unordered_map<void *, AnalysisResult> *results,
-        ASTContext *context)
+    explicit HeapAllocationAnalyzer(AnalysisResults *results,
+                                    ASTContext *context)
         : analysis_results(results), Context(context) {};
 
     virtual void run(const MatchFinder::MatchResult &result) {
@@ -167,77 +173,226 @@ class HeapAllocationAnalyzer : public MatchFinder::MatchCallback {
 
         bool success = false;
 
-        const VarDecl *var_decl;
-        if ((var_decl =
-                 result.Nodes.getNodeAs<clang::VarDecl>("mallocInitVA"))) {
-            success =
-                handle_malloc(var_decl, result, &nb_elements, &is_constant);
-        } else if ((var_decl = result.Nodes.getNodeAs<clang::VarDecl>(
-                        "callocInitVA"))) {
-            success =
-                handle_calloc(var_decl, result, &nb_elements, &is_constant);
+        const CallExpr *heap_allocation;
+        if ((heap_allocation =
+                 result.Nodes.getNodeAs<CallExpr>("callocCall"))) {
+            success = handle_calloc(result, &nb_elements, &is_constant);
+        } else if ((heap_allocation =
+                        result.Nodes.getNodeAs<CallExpr>("mallocCall"))) {
+            success = handle_malloc(result, &nb_elements, &is_constant);
         }
+
+        const QualType *declared_type =
+            result.Nodes.getNodeAs<clang::QualType>("declaredType");
 
         if (!success) {
             return;
         }
-        AnalysisResult analysis_result =
-            AnalysisResult(HeapInfo(nb_elements, is_constant));
-        if (!analysis_results->emplace((void *)var_decl, analysis_result)
-                 .second) {
-            std::cerr << "Variable was not successfully inserted :/\n";
-        };
-        const CallExpr *init = result.Nodes.getNodeAs<CallExpr>("init");
-        if (init == NULL) {
-            return;
-        }
-        if (!analysis_results->emplace((void *)init, analysis_result).second) {
-            std::cerr << "Variable was not successfully inserted ._.\n";
+
+        AnalysisResult analysis_result = AnalysisResult(PointerInfo(
+            true, true, declared_type->split().Ty, nb_elements, is_constant));
+
+        if (!analysis_results->add_result((uintptr_t)heap_allocation,
+                                          analysis_result)) {
+            std::cerr << "Heap allocation call analysis was not successfully "
+                         "inserted ._.\n";
         }
     }
 };
 
-DeclarationMatcher ReturnFinder =
-    functionDecl(hasBody(compoundStmt(
-                     hasDescendant(returnStmt().bind("returnStatement")))))
-        .bind("functionDeclaration");
-
-class FunctionAnalyzer : public MatchFinder::MatchCallback {
-    std::unordered_map<void *, AnalysisResult> *analysis_results;
+DeclarationMatcher HeapVarDeclFinder =
+    varDecl(hasInitializer(ignoringImpCasts(expr().bind("initializer"))))
+        .bind("variableDeclaration");
+class HeapVarDeclPropagator : public MatchFinder::MatchCallback {
+    AnalysisResults *analysis_results;
 
     ASTContext *Context;
 
   public:
-    explicit FunctionAnalyzer(
-        std::unordered_map<void *, AnalysisResult> *results,
-        ASTContext *context)
+    explicit HeapVarDeclPropagator(AnalysisResults *results,
+                                   ASTContext *context)
         : analysis_results(results), Context(context) {};
 
     virtual void run(const MatchFinder::MatchResult &result) {
-        if (const FunctionDecl *function_decl =
-                result.Nodes.getNodeAs<clang::FunctionDecl>(
-                    "functionDeclaration")) {
-            function_decl->dump();
-            const ReturnStmt *return_stmt =
-                result.Nodes.getNodeAs<ReturnStmt>("returnStatement");
-            if (return_stmt == NULL) {
-                return;
-            }
-            return_stmt->dump();
+        const VarDecl *var_declaration =
+            result.Nodes.getNodeAs<VarDecl>("variableDeclaration");
+        if (var_declaration == NULL) {
+            return;
         }
+        const Expr *initializer = result.Nodes.getNodeAs<Expr>("initializer");
+        if (initializer == NULL) {
+            return;
+        }
+        Optional<AnalysisResult> maybe_analysis_result =
+            analysis_results->get_analysis_result((uintptr_t)initializer);
+        if (!maybe_analysis_result.hasValue()) {
+            return;
+        }
+        AnalysisResult analysis_result = maybe_analysis_result.getValue();
+        Optional<PointerInfo> maybe_pointer_info =
+            analysis_result.get_pointer_info();
+        if (!maybe_pointer_info.hasValue()) {
+            return;
+        }
+        PointerInfo pointer_info = maybe_pointer_info.getValue();
+        const Type *declared_type = pointer_info.get_type();
+
+        if (pointer_info.get_is_alloc() &&
+            declared_type !=
+                var_declaration->getType()->getPointeeType().split().Ty) {
+            analysis_results->erase((uintptr_t)initializer->IgnoreImpCasts());
+            std::cerr << "Type missmatch detected for "
+                      << var_declaration->getNameAsString() << std::endl;
+            return;
+        }
+
+        analysis_result.unset_ptr_is_alloc();
+        analysis_result.get_pointer_info()->get_is_alloc();
+        analysis_results->add_result((uintptr_t)var_declaration,
+                                     analysis_result);
     }
 };
 
-void analyse_context(
-    std::unordered_map<void *, AnalysisResult> *analysis_results,
-    ASTContext *Context) {
+DeclarationMatcher ReturnFinder =
+    functionDecl(hasBody(compoundStmt(hasDescendant(
+                     returnStmt(hasReturnValue(ignoringImpCasts(
+                                    expr().bind("returnExpression"))))
+                         .bind("returnStatement")))))
+        .bind("functionDeclaration");
+class FunctionAnalyzer : public MatchFinder::MatchCallback {
+    AnalysisResults *analysis_results;
+
+    ASTContext *Context;
+
+    Optional<AnalysisResult> handle_declref(const DeclRefExpr *decl_ref) {
+        const ValueDecl *origin = (decl_ref->getDecl());
+        Optional<AnalysisResult> maybe_analysis_result =
+            analysis_results->get_analysis_result((uintptr_t)origin);
+        if (!maybe_analysis_result.hasValue()) {
+            return {};
+        }
+        AnalysisResult analysis_result = maybe_analysis_result.getValue();
+        analysis_results->add_result((uintptr_t)decl_ref, analysis_result);
+        return analysis_result;
+    }
+
+  public:
+    explicit FunctionAnalyzer(AnalysisResults *results, ASTContext *context)
+        : analysis_results(results), Context(context) {};
+
+    virtual void run(const MatchFinder::MatchResult &result) {
+        const FunctionDecl *function_decl =
+            result.Nodes.getNodeAs<clang::FunctionDecl>("functionDeclaration");
+
+        if (function_decl == NULL) {
+            return;
+        }
+
+        const ReturnStmt *return_stmt =
+            result.Nodes.getNodeAs<ReturnStmt>("returnStatement");
+        if (return_stmt == NULL) {
+            return;
+        }
+        const Expr *return_expr =
+            result.Nodes.getNodeAs<Expr>("returnExpression");
+        if (return_expr == NULL) {
+            return;
+        }
+
+        const DeclRefExpr *decl_ref =
+            result.Nodes.getNodeAs<DeclRefExpr>("returnExpression");
+        Optional<AnalysisResult> maybe_analysis_result = {};
+        if (decl_ref != NULL) {
+            maybe_analysis_result = handle_declref(decl_ref);
+        } else {
+            maybe_analysis_result =
+                analysis_results->get_analysis_result((uintptr_t)return_expr);
+        }
+
+        if (!maybe_analysis_result.hasValue()) {
+            return;
+        }
+        AnalysisResult analysis_result = maybe_analysis_result.getValue();
+        analysis_result.unset_ptr_is_alloc();
+        analysis_results->add_result((uintptr_t)function_decl, analysis_result);
+    }
+};
+
+auto CallExprMatcher =
+    callExpr(callee(functionDecl(isDefinition()).bind("calleeDef")))
+        .bind("callExpr");
+class CallExprPropagator : public MatchFinder::MatchCallback {
+    AnalysisResults *analysis_results;
+
+    ASTContext *Context;
+
+  public:
+    explicit CallExprPropagator(AnalysisResults *results, ASTContext *context)
+        : analysis_results(results), Context(context) {};
+
+    virtual void run(const MatchFinder::MatchResult &result) {
+        const CallExpr *call_expr =
+            result.Nodes.getNodeAs<CallExpr>("callExpr");
+        if (call_expr == NULL) {
+            return;
+        }
+        const FunctionDecl *function_decl =
+            result.Nodes.getNodeAs<FunctionDecl>("calleeDef");
+        if (function_decl == NULL) {
+            return;
+        }
+
+        Optional<AnalysisResult> maybe_analysis_result =
+            analysis_results->get_analysis_result((uintptr_t)function_decl);
+        if (!maybe_analysis_result.hasValue()) {
+            return;
+        }
+        AnalysisResult analysis_result = maybe_analysis_result.getValue();
+
+        analysis_results->add_result((uintptr_t)call_expr, analysis_result);
+    }
+};
+
+void match_heap_allocations(AnalysisResults *analysis_results,
+                            ASTContext *Context) {
     HeapAllocationAnalyzer heap_allocation_analyzer =
         HeapAllocationAnalyzer(analysis_results, Context);
+    MatchFinder heap_alloc_finder;
+    heap_alloc_finder.addMatcher(MallocExpr, &heap_allocation_analyzer);
+    heap_alloc_finder.addMatcher(CallocExpr, &heap_allocation_analyzer);
+    heap_alloc_finder.matchAST(*Context);
+}
+void match_variable_declarations(AnalysisResults *analysis_results,
+                                 ASTContext *Context) {
+    HeapVarDeclPropagator heap_var_decl_propagator =
+        HeapVarDeclPropagator(analysis_results, Context);
+    MatchFinder decl_finder = MatchFinder();
+    decl_finder.addMatcher(HeapVarDeclFinder, &heap_var_decl_propagator);
+    decl_finder.matchAST(*Context);
+}
+void match_fuction_returns(AnalysisResults *analysis_results,
+                           ASTContext *Context) {
     FunctionAnalyzer function_analyzer =
         FunctionAnalyzer(analysis_results, Context);
-    MatchFinder Finder;
-    Finder.addMatcher(MallocMatcher, &heap_allocation_analyzer);
-    Finder.addMatcher(CallocMatcher, &heap_allocation_analyzer);
-    Finder.addMatcher(ReturnFinder, &function_analyzer);
-    Finder.matchAST(*Context);
+    MatchFinder result_finder = MatchFinder();
+    result_finder.addMatcher(ReturnFinder, &function_analyzer);
+    result_finder.matchAST(*Context);
+}
+void match_call_expressions(AnalysisResults *analysis_results,
+                            ASTContext *Context) {
+    CallExprPropagator call_expr_propagator =
+        CallExprPropagator(analysis_results, Context);
+    MatchFinder call_expr_finder = MatchFinder();
+    call_expr_finder.addMatcher(CallExprMatcher, &call_expr_propagator);
+    call_expr_finder.matchAST(*Context);
+}
+
+void analyse_context(AnalysisResults *analysis_results, ASTContext *context) {
+    match_heap_allocations(analysis_results, context);
+    do {
+        analysis_results->reset_changed();
+        match_variable_declarations(analysis_results, context);
+        match_fuction_returns(analysis_results, context);
+        match_call_expressions(analysis_results, context);
+    } while (analysis_results->changed);
 }

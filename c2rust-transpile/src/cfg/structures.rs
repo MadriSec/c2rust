@@ -629,6 +629,7 @@ impl StructureState {
                         )] = then_branch.stmts.as_slice()
                         {
                             let e = mk().while_expr(
+                                // This is while for loops get converted to while loops.
                                 not(cond),
                                 mk().span(body_span)
                                     .block(body.iter().skip(1).cloned().collect()),

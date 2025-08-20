@@ -47,7 +47,7 @@ fn immediate_expr_children(kind: &CExprKind) -> Vec<SomeId> {
         Unary(_, _, subexpr, _) | ConstantExpr(_, subexpr, _) => intos![subexpr],
         UnaryType(_ty, _op, opt_expr_id, _) => opt_expr_id.iter().map(|&x| x.into()).collect(),
         Binary(_ty, _op, lhs, rhs, _, _) => intos![lhs, rhs],
-        Call(_, f, ref args) => {
+        Call(_, f, ref args, _) => {
             let mut res = intos![f];
             for &a in args {
                 res.push(a.into())
@@ -104,7 +104,7 @@ fn immediate_expr_children_all_types(kind: &CExprKind) -> Vec<SomeId> {
             res
         }
         Binary(_ty, _op, lhs, rhs, _, _) => intos![lhs, rhs],
-        Call(_, f, ref args) => {
+        Call(_, f, ref args, _) => {
             let mut res = intos![f];
             for &a in args {
                 res.push(a.into())

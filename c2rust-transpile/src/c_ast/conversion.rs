@@ -1362,8 +1362,17 @@ impl ConversionContext {
 
                     let ty_old = node.type_id.expect("Expected expression to have type");
                     let ty = self.visit_qualified_type(ty_old);
+                    let analysis_result = from_value::<Vec<Value>>(node.extras[0].clone())
+                        .expect("Should contain analysis results");
 
-                    let call = CExprKind::Call(ty, func, args);
+                    // None | 1 | Expr(ExprId, IsConstant)
+                    let heap_info: Option<PointerInfo> =
+                        match from_value::<Vec<Value>>(analysis_result[0].clone()) {
+                            Ok(value) => Some(PointerInfo::from((value, &mut self.id_mapper))),
+                            Err(_) => None,
+                        };
+
+                    let call = CExprKind::Call(ty, func, args, heap_info);
 
                     self.expr_possibly_as_stmt(expected_ty, new_id, node, call);
                 }
@@ -1832,6 +1841,16 @@ impl ConversionContext {
                         .expect("Expected to find attributes");
                     let attrs = parse_attributes(attributes);
 
+                    // Add here the malloced initialized information, and more in the future
+                    let analysis_result = from_value::<Vec<Value>>(node.extras[8].clone())
+                        .expect("Should contain analysis results");
+
+                    let return_pointer_info: Option<PointerInfo> =
+                        match from_value::<Vec<Value>>(analysis_result[0].clone()) {
+                            Ok(value) => Some(PointerInfo::from((value, &mut self.id_mapper))),
+                            Err(_) => None,
+                        };
+
                     // The always_inline attribute implies inline even if the
                     // inline keyword is not present.
                     is_inline |= attrs.contains(&Attribute::AlwaysInline);
@@ -1867,6 +1886,7 @@ impl ConversionContext {
                         name,
                         parameters,
                         typ,
+                        return_pointer_info,
                     };
 
                     self.add_decl(new_id, located(node, function_decl));
@@ -1959,26 +1979,10 @@ impl ConversionContext {
                         .expect("Should contain analysis results");
 
                     // None | 1 | Expr(ExprId, IsConstant)
-                    let heap_info: HeapInfo =
+                    let pointer_info: Option<PointerInfo> =
                         match from_value::<Vec<Value>>(analysis_result[0].clone()) {
-                            Ok(length_enum) => {
-                                let nb_elements = from_value::<u64>(length_enum[0].clone())
-                                    .expect("HeapInfo whould contain length info in first element");
-                                if nb_elements == 1 {
-                                    HeapInfo::One
-                                } else {
-                                    let new_id = self.id_mapper.get_or_create_new(nb_elements);
-                                    let is_constant = from_value::<bool>(length_enum[1].clone())
-                                        .expect(
-                                            "Expression variants should contain constantness value",
-                                        );
-                                    HeapInfo::Expr {
-                                        expr_id: CExprId(new_id),
-                                        is_constant,
-                                    }
-                                }
-                            }
-                            Err(_) => HeapInfo::None,
+                            Ok(value) => Some(PointerInfo::from((value, &mut self.id_mapper))),
+                            Err(_) => None,
                         };
 
                     assert!(
@@ -2011,7 +2015,7 @@ impl ConversionContext {
                         initializer,
                         typ,
                         attrs,
-                        heap_info,
+                        pointer_info,
                     };
 
                     self.add_decl(new_id, located(node, variable_decl));

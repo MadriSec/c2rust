@@ -11,7 +11,7 @@ impl<'c> Translation<'c> {
     /// Generate an integer literal corresponding to the given type, value, and base.
     pub fn mk_int_lit(
         &self,
-        ty: CQualTypeId,
+        _ty: CQualTypeId,
         val: u64,
         base: IntBase,
     ) -> TranslationResult<Box<Expr>> {

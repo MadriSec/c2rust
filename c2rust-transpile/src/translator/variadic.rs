@@ -103,7 +103,7 @@ impl<'c> Translation<'c> {
 
     pub fn match_vapart(&self, expr: CExprId) -> Option<VaPart> {
         match_or! { [self.ast_context[expr].kind]
-        CExprKind::Call(_, func, ref args) => (func, args) }
+        CExprKind::Call(_, func, ref args, _) => (func, args) }
         match_or! { [self.ast_context[func].kind]
         CExprKind::ImplicitCast(_, fexp, CastKind::BuiltinFnToFnPtr, _, _) => fexp }
         match_or! { [self.ast_context[fexp].kind]

@@ -161,7 +161,7 @@ impl<W: Write> Printer<W> {
             &DeclRef(_, decl, _) => {
                 self.print_decl_name(decl, context)?;
             }
-            &Call(_, func, ref args) => {
+            &Call(_, func, ref args, _) => {
                 self.print_expr(func, context)?;
                 self.writer.write_all(b"(")?;
 
