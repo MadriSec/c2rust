@@ -234,65 +234,64 @@ pub fn process(items: Value) -> error::Result<AstContext> {
         let entry_id: u64 = from_value(entry.pop_front().unwrap()).unwrap();
         let tag = from_value(entry.pop_front().unwrap()).unwrap();
 
-        if tag >= TypeTag::TagTypeUnknown as _ {
-            // If entry is a type
+        // Tags before the first type tag indicate AST nodes, after indicate type nodes.
+        if tag < TypeTag::TagTypeUnknown as _ {
+            let children = from_value::<Vec<Value>>(entry.pop_front().unwrap())
+                .unwrap()
+                .iter()
+                .map(|x| expect_opt_u64(x).unwrap())
+                .collect::<Vec<Option<u64>>>();
+
+            // entry[3]
+            let fileid = from_value(entry.pop_front().unwrap()).unwrap();
+            let begin_line = from_value(entry.pop_front().unwrap()).unwrap();
+            let begin_column = from_value(entry.pop_front().unwrap()).unwrap();
+            let end_line = from_value(entry.pop_front().unwrap()).unwrap();
+            let end_column = from_value(entry.pop_front().unwrap()).unwrap();
+
+            // entry[8]
+            let type_id: Option<u64> = expect_opt_u64(&entry.pop_front().unwrap()).unwrap();
+
+            // entry[9]
+            let rvalue = if from_value(entry.pop_front().unwrap()).unwrap() {
+                LRValue::RValue
+            } else {
+                LRValue::LValue
+            };
+
+            // entry[10]
+            let macro_expansions = from_value::<Vec<u64>>(entry.pop_front().unwrap()).unwrap();
+
+            let macro_expansion_text = expect_opt_str(&entry.pop_front().unwrap())
+                .unwrap()
+                .map(|s| s.to_string());
+
+            let node = AstNode {
+                tag: import_ast_tag(tag),
+                children,
+                loc: SrcSpan {
+                    fileid,
+                    begin_line,
+                    begin_column,
+                    end_line,
+                    end_column,
+                },
+                type_id,
+                rvalue,
+                macro_expansions,
+                macro_expansion_text,
+                extras: entry.into_iter().collect(),
+            };
+
+            asts.insert(entry_id, node);
+        } else {
             let node = TypeNode {
                 tag: import_type_tag(tag),
                 extras: entry.into_iter().collect(),
             };
 
             types.insert(entry_id, node);
-            continue;
         }
-
-        let children = from_value::<Vec<Value>>(entry.pop_front().unwrap())
-            .unwrap()
-            .iter()
-            .map(|x| expect_opt_u64(x).unwrap())
-            .collect::<Vec<Option<u64>>>();
-
-        // entry[3]
-        let fileid = from_value(entry.pop_front().unwrap()).unwrap();
-        let begin_line = from_value(entry.pop_front().unwrap()).unwrap();
-        let begin_column = from_value(entry.pop_front().unwrap()).unwrap();
-        let end_line = from_value(entry.pop_front().unwrap()).unwrap();
-        let end_column = from_value(entry.pop_front().unwrap()).unwrap();
-
-        // entry[8]
-        let type_id: Option<u64> = expect_opt_u64(&entry.pop_front().unwrap()).unwrap();
-
-        // entry[9]
-        let rvalue = if from_value(entry.pop_front().unwrap()).unwrap() {
-            LRValue::RValue
-        } else {
-            LRValue::LValue
-        };
-
-        // entry[10]
-        let macro_expansions = from_value::<Vec<u64>>(entry.pop_front().unwrap()).unwrap();
-
-        let macro_expansion_text = expect_opt_str(&entry.pop_front().unwrap())
-            .unwrap()
-            .map(|s| s.to_string());
-
-        let node = AstNode {
-            tag: import_ast_tag(tag),
-            children,
-            loc: SrcSpan {
-                fileid,
-                begin_line,
-                begin_column,
-                end_line,
-                end_column,
-            },
-            type_id,
-            rvalue,
-            macro_expansions,
-            macro_expansion_text,
-            extras: entry.into_iter().collect(),
-        };
-
-        asts.insert(entry_id, node);
     }
     Ok(AstContext {
         top_nodes,
